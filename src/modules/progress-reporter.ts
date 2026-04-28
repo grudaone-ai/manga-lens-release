@@ -42,6 +42,9 @@ const SUBTITLE_ID = 'manga-lens-progress-subtitle';
 const BAR_ID = 'manga-lens-progress-bar';
 const LOG_ID = 'manga-lens-progress-log';
 const TOGGLE_ID = 'manga-lens-progress-toggle';
+const HIDE_ID = 'manga-lens-progress-hide';
+const RESTORE_ID = 'manga-lens-progress-restore';
+const HIDDEN_STORAGE_KEY = 'manga-lens-progress-hidden';
 
 const STAGE_LABEL: Record<ProgressStage, string> = {
   idle: '待命',
@@ -89,12 +92,21 @@ function escapeText(value: string): string {
 
 export class ProgressReporter {
   private expanded = false;
+  private hidden = localStorage.getItem(HIDDEN_STORAGE_KEY) === '1';
   private lastUpdate: ProgressUpdate | null = null;
   private logs: string[] = [];
 
   update(update: ProgressUpdate): void {
     this.lastUpdate = update;
     this.ensurePanel();
+    this.applyVisibility();
+
+    if (this.hidden) {
+      if (!update.silentLog) {
+        this.pushLog(update);
+      }
+      return;
+    }
 
     const stage = STAGE_LABEL[update.stage] || update.stage;
     const elapsed = formatElapsed(update.elapsedMs);
@@ -156,6 +168,7 @@ export class ProgressReporter {
   }
 
   private ensurePanel(): void {
+    this.ensureRestoreButton();
     if (document.getElementById(PANEL_ID)) return;
 
     const panel = document.createElement('div');
@@ -166,13 +179,22 @@ export class ProgressReporter {
           <div id="${TITLE_ID}" class="manga-lens-progress-title">MangaLens</div>
           <div id="${SUBTITLE_ID}" class="manga-lens-progress-subtitle"></div>
         </div>
-        <button id="${TOGGLE_ID}" class="manga-lens-progress-toggle" type="button">详情</button>
+        <div style="display:flex;gap:6px;align-items:center;flex:0 0 auto;">
+          <button id="${HIDE_ID}" class="manga-lens-progress-toggle" type="button">隐藏</button>
+          <button id="${TOGGLE_ID}" class="manga-lens-progress-toggle" type="button">详情</button>
+        </div>
       </div>
       <div class="manga-lens-progress-track"><div id="${BAR_ID}" class="manga-lens-progress-bar"></div></div>
       <div id="${BODY_ID}" class="manga-lens-progress-body"></div>
       <div id="${LOG_ID}" class="manga-lens-progress-log"></div>
     `;
     document.body.appendChild(panel);
+
+    document.getElementById(HIDE_ID)?.addEventListener('click', () => {
+      this.hidden = true;
+      localStorage.setItem(HIDDEN_STORAGE_KEY, '1');
+      this.applyVisibility();
+    });
 
     document.getElementById(TOGGLE_ID)?.addEventListener('click', () => {
       this.expanded = !this.expanded;
@@ -183,6 +205,50 @@ export class ProgressReporter {
         this.update({ ...this.lastUpdate, silentLog: true });
       }
     });
+  }
+
+  private ensureRestoreButton(): void {
+    if (document.getElementById(RESTORE_ID)) return;
+
+    const restore = document.createElement('button');
+    restore.id = RESTORE_ID;
+    restore.type = 'button';
+    restore.textContent = 'ML';
+    restore.title = '显示 MangaLens 进度面板';
+    restore.style.cssText = [
+      'position:fixed',
+      'top:16px',
+      'right:16px',
+      'z-index:2147483647',
+      'display:none',
+      'border:0',
+      'border-radius:999px',
+      'padding:6px 10px',
+      'background:rgba(37,99,235,0.92)',
+      'color:#fff',
+      'font:700 12px "PingFang SC","Microsoft YaHei",sans-serif',
+      'box-shadow:0 6px 18px rgba(0,0,0,0.24)',
+      'cursor:pointer'
+    ].join(';');
+
+    restore.addEventListener('click', () => {
+      this.hidden = false;
+      localStorage.removeItem(HIDDEN_STORAGE_KEY);
+      this.applyVisibility();
+      if (this.lastUpdate) {
+        this.update({ ...this.lastUpdate, silentLog: true });
+      }
+    });
+
+    document.body.appendChild(restore);
+  }
+
+  private applyVisibility(): void {
+    const panel = document.getElementById(PANEL_ID) as HTMLElement | null;
+    const restore = document.getElementById(RESTORE_ID) as HTMLElement | null;
+
+    if (panel) panel.style.display = this.hidden ? 'none' : '';
+    if (restore) restore.style.display = this.hidden ? 'block' : 'none';
   }
 
   private renderBody(update: ProgressUpdate): string {
