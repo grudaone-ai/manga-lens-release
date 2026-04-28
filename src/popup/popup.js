@@ -1,7 +1,6 @@
 const toggleEnabled = document.getElementById('toggleEnabled');
 const zhipuApiKeyInput = document.getElementById('zhipuApiKey');
-const zhipuTranslationModelInput = document.getElementById('zhipuTranslationModel');
-const zhipuOcrModelInput = document.getElementById('zhipuOcrModel');
+const zhipuVisionModelInput = document.getElementById('zhipuVisionModel');
 const btnSave = document.getElementById('btnSave');
 const btnTest = document.getElementById('btnTest');
 const btnRefresh = document.getElementById('btnRefresh');
@@ -41,14 +40,13 @@ async function updateStatus() {
 async function loadConfig() {
   const result = await chrome.storage.local.get([
     'zhipuApiKey',
+    'zhipuVisionModel',
     'zhipuTranslationModel',
-    'zhipuOcrModel',
     'isEnabled'
   ]);
 
   zhipuApiKeyInput.value = result.zhipuApiKey || '';
-  zhipuTranslationModelInput.value = result.zhipuTranslationModel || 'glm-4.7';
-  zhipuOcrModelInput.value = result.zhipuOcrModel || 'glm-ocr';
+  zhipuVisionModelInput.value = result.zhipuVisionModel || result.zhipuTranslationModel || 'glm-4.6v';
   toggleEnabled.checked = result.isEnabled !== false;
 }
 
@@ -69,8 +67,7 @@ async function notifyContentScript(config) {
 async function saveConfig() {
   const config = {
     zhipuApiKey: zhipuApiKeyInput.value.trim(),
-    zhipuTranslationModel: zhipuTranslationModelInput.value.trim() || 'glm-4.7',
-    zhipuOcrModel: zhipuOcrModelInput.value.trim() || 'glm-ocr'
+    zhipuVisionModel: zhipuVisionModelInput.value.trim() || 'glm-4.6v'
   };
 
   if (!config.zhipuApiKey) {
@@ -80,7 +77,7 @@ async function saveConfig() {
 
   await chrome.storage.local.set(config);
   await notifyContentScript(config);
-  showAlert('智谱配置已保存', 'success');
+  showAlert('智谱视觉模型配置已保存', 'success');
   return config;
 }
 
@@ -90,24 +87,7 @@ btnTest.addEventListener('click', async () => {
   const config = await saveConfig();
   if (!config) return;
 
-  showAlert('正在测试智谱 OCR...', 'warning');
-
-  try {
-    const response = await chrome.runtime.sendMessage({
-      target: 'background',
-      type: 'TEST_ZHIPU_OCR',
-      apiKey: config.zhipuApiKey,
-      model: config.zhipuOcrModel
-    });
-
-    if (response?.success) {
-      showAlert(response.message || '智谱连接成功', 'success');
-    } else {
-      showAlert(response?.message || '智谱连接失败', 'error');
-    }
-  } catch (error) {
-    showAlert(error.message || '智谱连接测试失败', 'error');
-  }
+  showAlert('配置已保存。请在 Pixiv 作品页点击“重新定位当前 Pixiv 漫画页”进行真实测试。', 'success');
 });
 
 btnRefresh.addEventListener('click', async () => {
@@ -115,7 +95,7 @@ btnRefresh.addEventListener('click', async () => {
     const tab = await getActiveTab();
     if (tab?.id) {
       await chrome.tabs.sendMessage(tab.id, { type: 'REFRESH' });
-      showAlert('已刷新，正在重新翻译', 'success');
+      showAlert('已重新定位当前 Pixiv 漫画页', 'success');
     }
   } catch {
     showAlert('刷新失败，请先刷新网页后重试', 'error');
@@ -130,7 +110,7 @@ btnSelect.addEventListener('click', async () => {
       window.close();
     }
   } catch {
-    showAlert('选择失败，请先刷新网页后重试', 'error');
+    showAlert('处理失败，请先刷新网页后重试', 'error');
   }
 });
 
