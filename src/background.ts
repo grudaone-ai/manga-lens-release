@@ -51,7 +51,7 @@ async function fetchWithTimeout(url: string, options: RequestInit, timeoutMs = 1
   }
 }
 
-async function fetchImageAsBase64(imageUrl: string, pageUrl?: string): Promise<string> {
+async function fetchImageAsBase64(imageUrl: string, pageUrl?: string): Promise<{ base64: string; contentType: string }> {
   const response = await fetchWithTimeout(imageUrl, buildFetchOptions(imageUrl, pageUrl));
   if (!response.ok) {
     throw new Error(`图片获取失败: HTTP ${response.status}`);
@@ -65,7 +65,7 @@ async function fetchImageAsBase64(imageUrl: string, pageUrl?: string): Promise<s
   }
 
   const contentType = response.headers.get('content-type') || 'image/jpeg';
-  return `data:${contentType};base64,${btoa(binary)}`;
+  return { base64: `data:${contentType};base64,${btoa(binary)}`, contentType };
 }
 
 function queryActiveTab(): Promise<chrome.tabs.Tab | null> {
@@ -201,8 +201,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     case 'FETCH_IMAGE_AS_BASE64':
       (async () => {
         try {
-          const base64 = await fetchImageAsBase64(message.imageUrl, message.pageUrl);
-          sendResponse({ success: true, base64 });
+          const result = await fetchImageAsBase64(message.imageUrl, message.pageUrl);
+          sendResponse({ success: true, base64: result.base64, contentType: result.contentType });
         } catch (error) {
           sendResponse({
             success: false,
@@ -212,11 +212,38 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       })();
       return true;
 
+    case 'RECOGNIZE_ZHIPU_OCR_BASE64':
+      (async () => {
+        try {
+          const result = await recognizeWithZhipuOCR(
+            message.imageBase64,
+            message.apiKey,
+            message.model || 'glm-ocr'
+          );
+
+          sendResponse({
+            success: true,
+            text: result.text,
+            items: result.items,
+            requestId: result.requestId,
+            source: message.source || 'element-canvas',
+            sourceWidth: message.sourceWidth,
+            sourceHeight: message.sourceHeight,
+            sourceMessage: message.sourceMessage
+          });
+        } catch (error) {
+          sendResponse({
+            success: false,
+            source: message.source || 'element-canvas',
+            message: error instanceof Error ? error.message : '智谱 OCR 识别失败'
+          });
+        }
+      })();
+      return true;
+
     case 'TEST_ZHIPU_OCR':
       (async () => {
         try {
-          // 原测试图是 10x10 纯色图，OCR 正确返回空结果时也容易被误判为错误。
-          // 这里换成真实含字母数字的 PNG，能同时验证 Key、模型名、接口格式。
           const testImageBase64 = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAPAAAABQCAIAAACoK28rAAAEdklEQVR4nO3dPUh6XxzH8dsDhRIIgmUJtQQG0QPdIexBr1l3aS1bKiNoiZqiWoKWQCRoKBoqUNsighwqTCMosqKhwaWhNqPggj1QWFp5/sOFi/Sz/v3+/uD/88vnNZ17POd4L7x7wIZyGGMcABW5//cNAPxJCBpIQdBACoIGUhA0kIKggRQEDaQgaCAFQQMpCBpIQdBACoIGUhA0kIKggRQEDaQgaCAFQQMpCBpIQdBACoIGUhA0kIKggRQEDaQgaCAFQQMpCBpIyTRoj8fD87zJZOJ5fnV1VZ5cWVlpaGiwWCydnZ2RSESeVKvVgiBYLJaGhoaDgwN5cnNzUxAEQRDy8/PlwcbGhrxSNjc3x3Hc+fm5KIpWq7WjoyMSiaTdJR/48PAwMDCg0WiUO3S73a2trfX19YFAgOO4WCzW09MjCALP89vb2xk+Pvx1WAb8fn9zc/P9/T1j7P7+vrm5ORgMBgIBq9Uai8UYYzs7O21tbfJijUYjD8LhcE1NzaejlFc/jWV1dXWRSIQxtrGxYbfbv1nZ0tIyPz+vzEuSZDabPz4+Li4uqqqqGGMul2t2dpYxdnNzU1FR8Z+eG/5eGQVts9mOj4+Vy1Ao1N7eLoriycmJMjk0NJRIJFhKfMlkUqvVfjrq+6BLS0svLy8ZY4lE4vDw8JuVt7e3qfMXFxfr6+uMsefnZ51Oxxi7u7uLx+OMsWAwWFlZ+TuPC1kgo6DLyspeXl6Uy5eXl7KyMoPB8Pr6+utiJTK/39/V1fXVqyxdph6PR6/XDw4O7u/vf7Xr+3mv1zs4OKhc9vb2qtXqvb29tNshe/3JoGOxmMFg0Ov1aYNWqVQWi6WpqUmr1crfR1OlJiivlCk/Ae7u7txud21t7fT0dNpdX53GGLu6uqqurpYkKXXS5/P19fX96zNCdsko6Pb29lAopFweHR2Jomg2m09PT+WZZDLZ398vj5XIXC6X0+n8dNQ336ElSVLeRZKkkpKSr1amnX96euJ5XrmlkZGRt7c3xtj7+/uvv/lAtsvoU47x8fGJiYnHx0eO4x4eHiYnJycmJoaHh6empuLxOMdxa2tr8iBVR0fH2dnZz98lJyfHbrfLn5ZEo9Hy8vKf72WMORyOsbGxxsZGeebx8dHn83Ecd3x8bDQaf34UZIX8TDaLonh9fW21WgsLCxOJxOjoqM1m4zju8vKS53mdTldcXLy4uPhpl9FoDIfDyWQyNzf9l1MikRAEQR6bTCan07m8vNzd3a1SqfLy8txu98/v0Ov17u7uRqPRpaWloqKira2tmZkZh8OxsLBQUFDwW0dBVshh+JcUQAj+UgikIGggBUEDKQgaSEHQQAqCBlIQNJCCoIEUBA2kIGggBUEDKQgaSEHQQAqCBlIQNJCCoIEUBA2kIGggBUEDKQgaSEHQQAqCBlIQNJCCoIEUBA2kIGggBUEDKQgaSEHQQAqCBlIQNJCCoIEUBA2kIGggBUEDKQgaSEHQQAqCBlIQNJCCoIEUBA2kIGggBUEDKQgaSPkHsXrIuAOLC/QAAAAASUVORK5CYII=';
           const result = await recognizeWithZhipuOCR(testImageBase64, message.apiKey, message.model || 'glm-ocr');
 
@@ -240,7 +267,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           let imageBase64: string;
 
           try {
-            imageBase64 = await fetchImageAsBase64(message.imageUrl, message.pageUrl);
+            const fetched = await fetchImageAsBase64(message.imageUrl, message.pageUrl);
+            imageBase64 = fetched.base64;
           } catch (error) {
             const messageText = error instanceof Error ? error.message : String(error);
             const isForbidden = messageText.includes('HTTP 403') || messageText.includes('Failed to fetch');
@@ -261,24 +289,33 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
               text: fallbackResult.text,
               items: fallbackResult.items,
               requestId: fallbackResult.requestId,
+              source: 'visible-tab-capture',
               sourceWidth: Math.round(message.cropRect.width * (message.devicePixelRatio || 1)),
               sourceHeight: Math.round(message.cropRect.height * (message.devicePixelRatio || 1)),
+              sourceMessage: `background fetch 失败: ${messageText}；已回退截图 OCR`,
               fallback: 'visible-tab-capture'
             });
             return;
           }
 
-          const result = await recognizeWithZhipuOCR(imageBase64, message.apiKey, message.model || 'glm-ocr');
+          const result = await recognizeWithZhipuOCR(
+            imageBase64,
+            message.apiKey,
+            message.model || 'glm-ocr'
+          );
 
           sendResponse({
             success: true,
             text: result.text,
             items: result.items,
-            requestId: result.requestId
+            requestId: result.requestId,
+            source: 'background-fetch',
+            sourceMessage: '已通过 background fetch 获取图片 URL'
           });
         } catch (error) {
           sendResponse({
             success: false,
+            source: 'background-fetch',
             message: error instanceof Error ? error.message : '智谱 OCR 识别失败'
           });
         }
