@@ -235,6 +235,8 @@ export class MangaOCR {
       imageUrl,
       pageUrl: window.location.href,
       cropRect,
+      viewportWidth: window.innerWidth,
+      viewportHeight: window.innerHeight,
       devicePixelRatio: window.devicePixelRatio || 1,
       apiKey: this.config.zhipuApiKey,
       model: this.config.zhipuOcrModel
