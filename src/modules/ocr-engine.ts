@@ -13,11 +13,21 @@ import {
   BatchTranslator,
   type BatchTranslationResult
 } from './batch-translator';
+import {
+  captureImageElementAsBase64,
+  type ImageSourceMethod
+} from './image-source';
 
 export interface OCRResult {
   text: string;
   boxes: BoundingBox[];
   confidence: number;
+  source?: ImageSourceMethod;
+  sourceMessage?: string;
+  sourceWidth?: number;
+  sourceHeight?: number;
+  requestId?: string;
+  warnings?: string[];
 }
 
 export interface BoundingBox {
@@ -76,7 +86,7 @@ function scaleResultToImageSize(
   toWidth: number,
   toHeight: number
 ): OCRResult {
-  if (!fromWidth || !fromHeight || fromWidth === toWidth && fromHeight === toHeight) return result;
+  if (!fromWidth || !fromHeight || (fromWidth === toWidth && fromHeight === toHeight)) return result;
 
   const scaleX = toWidth / fromWidth;
   const scaleY = toHeight / fromHeight;
@@ -90,6 +100,18 @@ function scaleResultToImageSize(
       height: box.height * scaleY
     }))
   };
+}
+
+function sendMessageToBackground<T = any>(message: Record<string, unknown>): Promise<T> {
+  return new Promise((resolve, reject) => {
+    chrome.runtime.sendMessage(message, (response) => {
+      if (chrome.runtime.lastError) {
+        reject(new Error(chrome.runtime.lastError.message));
+        return;
+      }
+      resolve(response as T);
+    });
+  });
 }
 
 export class MangaOCR {
@@ -132,12 +154,72 @@ export class MangaOCR {
       throw new Error('无法获取图片地址');
     }
 
-    return this.recognizeViaBackground(imageElement, imageUrl);
+    const warnings: string[] = [];
+
+    try {
+      return await this.recognizeViaElementCanvas(imageElement, warnings);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      warnings.push(`element-canvas 失败: ${message}`);
+      console.warn('[MangaLens] element-canvas OCR 失败，尝试 background fetch:', error);
+    }
+
+    return this.recognizeViaBackground(imageElement, imageUrl, warnings);
+  }
+
+  private async recognizeViaElementCanvas(
+    imageElement: HTMLImageElement,
+    warnings: string[]
+  ): Promise<OCRResult> {
+    const captured = await captureImageElementAsBase64(imageElement);
+    const response = await sendMessageToBackground<any>({
+      target: 'background',
+      type: 'RECOGNIZE_ZHIPU_OCR_BASE64',
+      imageBase64: captured.base64,
+      source: captured.method,
+      sourceWidth: captured.sourceWidth,
+      sourceHeight: captured.sourceHeight,
+      sourceMessage: captured.message,
+      apiKey: this.config.zhipuApiKey,
+      model: this.config.zhipuOcrModel
+    });
+
+    if (!response?.success) {
+      throw new Error(response?.message || '页面图片 OCR 识别失败');
+    }
+
+    const naturalWidth = imageElement.naturalWidth || imageElement.width || captured.sourceWidth;
+    const naturalHeight = imageElement.naturalHeight || imageElement.height || captured.sourceHeight;
+    const sourceWidth = Number(response.sourceWidth) || captured.sourceWidth;
+    const sourceHeight = Number(response.sourceHeight) || captured.sourceHeight;
+
+    const ocrResult = convertZhipuOCRResultToOCRResult(
+      {
+        text: response.text || '',
+        items: (response.items || []) as ZhipuOCRLayoutItem[],
+        requestId: response.requestId,
+        raw: response
+      },
+      sourceWidth,
+      sourceHeight
+    );
+
+    const scaled = scaleResultToImageSize(ocrResult, sourceWidth, sourceHeight, naturalWidth, naturalHeight);
+    return {
+      ...scaled,
+      source: 'element-canvas',
+      sourceMessage: response.sourceMessage || captured.message,
+      sourceWidth,
+      sourceHeight,
+      requestId: response.requestId,
+      warnings
+    };
   }
 
   private async recognizeViaBackground(
     imageElement: HTMLImageElement,
-    imageUrl: string
+    imageUrl: string,
+    warnings: string[] = []
   ): Promise<OCRResult> {
     const rect = imageElement.getBoundingClientRect();
     const cropRect: ViewportCropRect = {
@@ -147,49 +229,47 @@ export class MangaOCR {
       height: rect.height
     };
 
-    return new Promise((resolve, reject) => {
-      chrome.runtime.sendMessage(
-        {
-          target: 'background',
-          type: 'FETCH_IMAGE_AND_ZHIPU_OCR',
-          imageUrl,
-          pageUrl: window.location.href,
-          cropRect,
-          devicePixelRatio: window.devicePixelRatio || 1,
-          apiKey: this.config.zhipuApiKey,
-          model: this.config.zhipuOcrModel
-        },
-        (response) => {
-          if (chrome.runtime.lastError) {
-            reject(new Error(chrome.runtime.lastError.message));
-            return;
-          }
-
-          if (!response?.success) {
-            reject(new Error(response?.message || '智谱 OCR 识别失败'));
-            return;
-          }
-
-          const naturalWidth = imageElement.naturalWidth || imageElement.width || Math.round(cropRect.width);
-          const naturalHeight = imageElement.naturalHeight || imageElement.height || Math.round(cropRect.height);
-          const sourceWidth = Number(response.sourceWidth) || naturalWidth;
-          const sourceHeight = Number(response.sourceHeight) || naturalHeight;
-
-          const ocrResult = convertZhipuOCRResultToOCRResult(
-            {
-              text: response.text || '',
-              items: (response.items || []) as ZhipuOCRLayoutItem[],
-              requestId: response.requestId,
-              raw: response
-            },
-            sourceWidth,
-            sourceHeight
-          );
-
-          resolve(scaleResultToImageSize(ocrResult, sourceWidth, sourceHeight, naturalWidth, naturalHeight));
-        }
-      );
+    const response = await sendMessageToBackground<any>({
+      target: 'background',
+      type: 'FETCH_IMAGE_AND_ZHIPU_OCR',
+      imageUrl,
+      pageUrl: window.location.href,
+      cropRect,
+      devicePixelRatio: window.devicePixelRatio || 1,
+      apiKey: this.config.zhipuApiKey,
+      model: this.config.zhipuOcrModel
     });
+
+    if (!response?.success) {
+      rejectWithWarnings(response?.message || '智谱 OCR 识别失败', warnings);
+    }
+
+    const naturalWidth = imageElement.naturalWidth || imageElement.width || Math.round(cropRect.width);
+    const naturalHeight = imageElement.naturalHeight || imageElement.height || Math.round(cropRect.height);
+    const sourceWidth = Number(response.sourceWidth) || naturalWidth;
+    const sourceHeight = Number(response.sourceHeight) || naturalHeight;
+
+    const ocrResult = convertZhipuOCRResultToOCRResult(
+      {
+        text: response.text || '',
+        items: (response.items || []) as ZhipuOCRLayoutItem[],
+        requestId: response.requestId,
+        raw: response
+      },
+      sourceWidth,
+      sourceHeight
+    );
+
+    const scaled = scaleResultToImageSize(ocrResult, sourceWidth, sourceHeight, naturalWidth, naturalHeight);
+    return {
+      ...scaled,
+      source: response.source || response.fallback || 'background-fetch',
+      sourceMessage: response.sourceMessage,
+      sourceWidth,
+      sourceHeight,
+      requestId: response.requestId,
+      warnings
+    };
   }
 
   async recognizeAndMerge(
@@ -277,6 +357,11 @@ export class MangaOCR {
       imageSize
     };
   }
+}
+
+function rejectWithWarnings(message: string, warnings: string[]): never {
+  const detail = warnings.length > 0 ? `；此前尝试: ${warnings.join('；')}` : '';
+  throw new Error(`${message}${detail}`);
 }
 
 export async function testZhipuOCRConnection(
