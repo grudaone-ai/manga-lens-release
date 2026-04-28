@@ -28,6 +28,11 @@ export interface ProgressUpdate {
   warning?: string;
   error?: string;
   elapsedMs?: number;
+  concurrency?: string | number;
+  timerSummary?: string;
+  activePages?: string[];
+  queuedPages?: string[];
+  silentLog?: boolean;
 }
 
 const PANEL_ID = 'manga-lens-progress-panel';
@@ -96,14 +101,16 @@ export class ProgressReporter {
     const parts = [stage];
     if (update.imageIndex && update.imageTotal) parts.push(`图片 ${update.imageIndex}/${update.imageTotal}`);
     if (update.queueLength !== undefined) parts.push(`队列 ${update.queueLength}`);
+    if (update.concurrency !== undefined) parts.push(`并发 ${update.concurrency}`);
     if (elapsed) parts.push(`耗时 ${elapsed}`);
 
     const detailParts: string[] = [];
     if (update.source) detailParts.push(`来源: ${update.source}`);
     if (update.ocrBoxes !== undefined) detailParts.push(`OCR框: ${update.ocrBoxes}`);
     if (update.dialogs !== undefined) detailParts.push(`对话: ${update.dialogs}`);
-    if (update.totalToTranslate !== undefined) detailParts.push(`翻译: ${update.translated || 0}/${update.totalToTranslate}`);
+    if (update.totalToTranslate !== undefined) detailParts.push(`完成: ${update.translated || 0}/${update.totalToTranslate}`);
     if (update.rendered !== undefined) detailParts.push(`渲染: ${update.rendered}`);
+    if (update.timerSummary) detailParts.push(update.timerSummary);
 
     const panel = document.getElementById(PANEL_ID);
     const title = document.getElementById(TITLE_ID);
@@ -116,15 +123,17 @@ export class ProgressReporter {
       panel.classList.toggle('is-expanded', this.expanded);
     }
     if (title) title.textContent = update.title;
-    if (subtitle) subtitle.textContent = [parts.join(' · '), update.detail, detailParts.join(' · ')].filter(Boolean).join('\n');
+    if (subtitle) subtitle.textContent = [parts.join(' · '), update.detail, detailParts.join('\n')].filter(Boolean).join('\n');
     if (bar) bar.style.width = `${this.calculatePercent(update)}%`;
 
     if (body) {
       body.innerHTML = this.renderBody(update);
     }
 
-    this.pushLog(update);
-    this.renderLog();
+    if (!update.silentLog) {
+      this.pushLog(update);
+      this.renderLog();
+    }
   }
 
   clear(delayMs = 1200): void {
@@ -137,9 +146,10 @@ export class ProgressReporter {
   }
 
   private calculatePercent(update: ProgressUpdate): number {
-    if (update.stage === 'translate' && update.totalToTranslate) {
+    if (update.totalToTranslate) {
       const local = Math.min(1, Math.max(0, (update.translated || 0) / update.totalToTranslate));
-      return Math.round(68 + local * 20);
+      if (update.stage === 'done') return 100;
+      return Math.round(10 + local * 85);
     }
 
     return STAGE_WEIGHT[update.stage] ?? 0;
@@ -170,7 +180,7 @@ export class ProgressReporter {
       const toggle = document.getElementById(TOGGLE_ID);
       if (toggle) toggle.textContent = this.expanded ? '收起' : '详情';
       if (this.lastUpdate) {
-        this.update(this.lastUpdate);
+        this.update({ ...this.lastUpdate, silentLog: true });
       }
     });
   }
@@ -180,10 +190,14 @@ export class ProgressReporter {
       ['阶段', STAGE_LABEL[update.stage]],
       ['图片', update.imageIndex && update.imageTotal ? `${update.imageIndex}/${update.imageTotal}` : undefined],
       ['队列', update.queueLength],
+      ['并发', update.concurrency],
       ['来源', update.source],
       ['OCR 文本框', update.ocrBoxes],
       ['合并对话', update.dialogs],
-      ['翻译进度', update.totalToTranslate !== undefined ? `${update.translated || 0}/${update.totalToTranslate}` : undefined],
+      ['完成页数', update.totalToTranslate !== undefined ? `${update.translated || 0}/${update.totalToTranslate}` : undefined],
+      ['页面计时', update.timerSummary],
+      ['处理中', update.activePages?.join(' ｜ ')],
+      ['等待队列', update.queuedPages?.join('，')],
       ['渲染数量', update.rendered],
       ['耗时', formatElapsed(update.elapsedMs)],
       ['警告', update.warning],
