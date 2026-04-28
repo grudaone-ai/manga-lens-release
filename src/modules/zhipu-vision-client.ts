@@ -16,37 +16,9 @@ export interface PixivVisionTranslationResult {
 const ZHIPU_CHAT_ENDPOINT = 'https://open.bigmodel.cn/api/paas/v4/chat/completions';
 const DEFAULT_VISION_MODEL = 'glm-4.6v';
 
-const SYSTEM_PROMPT = `你是 Pixiv 漫画实时翻译引擎。
-你的输入是一张 Pixiv 漫画页图片。你的任务是识别漫画画面内的日文台词、旁白、拟声词，并翻译为自然、简洁的简体中文。
+const SYSTEM_PROMPT = '你是 Pixiv 漫画实时翻译引擎。识别图片内日文漫画文字并翻译成自然简体中文。只处理漫画画面内文字，不处理网页 UI、作者名、标签、评论、水印。合并同一气泡或同一段连续文字。译文简短，适合覆盖回气泡。严格输出 JSON，不要解释。bbox 使用 0-1000 相对坐标。';
 
-规则：
-1. 只处理漫画图片内部文字，不处理 Pixiv 网页 UI、作者名、标签、评论、按钮、页码、水印或浏览器界面。
-2. 同一个气泡、同一段连续竖排文字、同一条旁白要合并成一条，不要逐字逐列拆开。
-3. 译文要短、自然、口语化，适合覆盖回漫画气泡位置。
-4. 保留角色语气、吐槽、害羞、命令、疑问等漫画表达。
-5. 坐标 bbox 必须对应原文所在区域，使用相对输入图片的 0-1000 归一化坐标：[x1, y1, x2, y2]。
-6. 严格输出 JSON，不要输出 Markdown、解释、分析或多余文本。`;
-
-const USER_PROMPT = `请翻译这张 Pixiv 漫画页，并严格返回如下 JSON：
-{
-  "items": [
-    {
-      "id": 1,
-      "sourceText": "原文",
-      "translatedText": "简体中文译文",
-      "bbox": [x1, y1, x2, y2],
-      "orientation": "vertical",
-      "kind": "speech"
-    }
-  ]
-}
-
-字段要求：
-- id 从 1 开始递增。
-- bbox 坐标范围为 0 到 1000，表示输入图片的相对位置。
-- orientation 只能是 "vertical" 或 "horizontal"。
-- kind 只能是 "speech"、"sfx"、"narration" 或 "other"。
-- 没有可翻译文字时返回 {"items":[]}。`;
+const USER_PROMPT = '返回 JSON：{"items":[{"id":1,"sourceText":"原文","translatedText":"简体中文","bbox":[x1,y1,x2,y2],"orientation":"vertical|horizontal","kind":"speech|sfx|narration|other"}]}。无文字返回 {"items":[]}。';
 
 function stripDataUrlPrefix(imageBase64: string): string {
   if (imageBase64.startsWith('data:')) return imageBase64;
@@ -171,8 +143,9 @@ export async function translatePixivMangaImageWithVision(
           ]
         }
       ],
-      temperature: 0.2,
-      max_tokens: 4000,
+      temperature: 0,
+      top_p: 0.7,
+      max_tokens: 1800,
       stream: false,
       thinking: { type: 'disabled' }
     })
