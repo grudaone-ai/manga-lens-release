@@ -65,6 +65,33 @@ async function getExtensionConfig(): Promise<ExtensionConfig> {
   });
 }
 
+function getImageUrl(imageElement: HTMLImageElement): string {
+  return imageElement.currentSrc || imageElement.src || imageElement.dataset.src || imageElement.dataset.lazySrc || '';
+}
+
+function scaleResultToImageSize(
+  result: OCRResult,
+  fromWidth: number,
+  fromHeight: number,
+  toWidth: number,
+  toHeight: number
+): OCRResult {
+  if (!fromWidth || !fromHeight || fromWidth === toWidth && fromHeight === toHeight) return result;
+
+  const scaleX = toWidth / fromWidth;
+  const scaleY = toHeight / fromHeight;
+  return {
+    ...result,
+    boxes: result.boxes.map((box) => ({
+      ...box,
+      x: box.x * scaleX,
+      y: box.y * scaleY,
+      width: box.width * scaleX,
+      height: box.height * scaleY
+    }))
+  };
+}
+
 export class MangaOCR {
   private isInitialized = false;
   private config: ExtensionConfig = {
@@ -100,7 +127,7 @@ export class MangaOCR {
       throw new Error('未配置智谱 API Key，请先在扩展设置中填写');
     }
 
-    const imageUrl = imageElement.src || imageElement.currentSrc;
+    const imageUrl = getImageUrl(imageElement);
     if (!imageUrl) {
       throw new Error('无法获取图片地址');
     }
@@ -133,10 +160,20 @@ export class MangaOCR {
           model: this.config.zhipuOcrModel
         },
         (response) => {
+          if (chrome.runtime.lastError) {
+            reject(new Error(chrome.runtime.lastError.message));
+            return;
+          }
+
           if (!response?.success) {
             reject(new Error(response?.message || '智谱 OCR 识别失败'));
             return;
           }
+
+          const naturalWidth = imageElement.naturalWidth || imageElement.width || Math.round(cropRect.width);
+          const naturalHeight = imageElement.naturalHeight || imageElement.height || Math.round(cropRect.height);
+          const sourceWidth = Number(response.sourceWidth) || naturalWidth;
+          const sourceHeight = Number(response.sourceHeight) || naturalHeight;
 
           const ocrResult = convertZhipuOCRResultToOCRResult(
             {
@@ -145,11 +182,11 @@ export class MangaOCR {
               requestId: response.requestId,
               raw: response
             },
-            imageElement.naturalWidth || imageElement.width,
-            imageElement.naturalHeight || imageElement.height
+            sourceWidth,
+            sourceHeight
           );
 
-          resolve(ocrResult);
+          resolve(scaleResultToImageSize(ocrResult, sourceWidth, sourceHeight, naturalWidth, naturalHeight));
         }
       );
     });
