@@ -1,21 +1,33 @@
 {
   "manifest_version": 3,
   "name": "MangaLens",
-  "version": "1.1.0",
-  "description": "Translate manga pages in place with Zhipu GLM-OCR and GLM-4.7.",
+  "version": "4.0.1",
+  "description": "Pixiv manga translator using Pixiv HTML containers and Zhipu GLM-4.6V.",
   "permissions": [
     "activeTab",
-    "storage"
+    "storage",
+    "declarativeNetRequest"
   ],
   "host_permissions": [
-    "<all_urls>"
+    "https://www.pixiv.net/*",
+    "https://i.pximg.net/*",
+    "https://open.bigmodel.cn/*"
   ],
+  "declarative_net_request": {
+    "rule_resources": [
+      {
+        "id": "pixiv_referer_rules",
+        "enabled": true,
+        "path": "rules/pixiv-referer.json"
+      }
+    ]
+  },
   "action": {
     "default_popup": "src/popup/index.html"
   },
   "content_scripts": [
     {
-      "matches": ["<all_urls>"],
+      "matches": ["https://www.pixiv.net/*"],
       "js": ["content-script.js"],
       "css": ["content-styles.css"],
       "run_at": "document_idle"
