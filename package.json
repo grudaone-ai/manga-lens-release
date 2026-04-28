@@ -1,22 +1,16 @@
 {
   "name": "manga-lens",
-  "version": "1.0.0",
-  "description": "MangaLens - 漫画实时翻译器，让你无感阅读生肉漫画",
+  "version": "4.0.0",
+  "description": "MangaLens - Pixiv 漫画实时翻译器，基于 Pixiv HTML 容器选图并使用 GLM-4.6V 直接识别翻译",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "vite build && node post-build.mjs",
     "preview": "vite preview"
   },
-  "dependencies": {
-    "@huggingface/transformers": "^3.0.0",
-    "crypto-js": "^4.2.0",
-    "vue": "^3.4.21"
-  },
+  "dependencies": {},
   "devDependencies": {
     "@types/chrome": "^0.0.263",
-    "@types/crypto-js": "^4.2.2",
-    "esbuild": "^0.24.0",
     "typescript": "^5.4.0",
     "vite": "^5.2.0"
   }
