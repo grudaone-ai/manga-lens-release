@@ -5,6 +5,8 @@ export interface TranslationOverlay {
   translatedText: string;
   element: HTMLElement;
   imageElement: HTMLImageElement;
+  item: PixivVisionTranslationItem;
+  config: Required<RenderConfig>;
 }
 
 export interface RenderConfig {
@@ -26,16 +28,6 @@ const DEFAULT_RENDER_CONFIG: Required<RenderConfig> = {
 function clamp(value: number, min: number, max: number): number {
   if (!Number.isFinite(value)) return min;
   return Math.max(min, Math.min(max, value));
-}
-
-function getDocumentRect(element: HTMLElement): DOMRect {
-  const rect = element.getBoundingClientRect();
-  return new DOMRect(
-    rect.left + window.scrollX,
-    rect.top + window.scrollY,
-    rect.width,
-    rect.height
-  );
 }
 
 function hexToRgba(hex: string, alpha: number): string {
@@ -61,6 +53,8 @@ export class TranslationOverlayManager {
   private overlays: Map<string, TranslationOverlay> = new Map();
   private containerId = 'manga-lens-overlay-container';
   private overlayClass = 'manga-lens-text-overlay';
+  private syncScheduled = false;
+  private autoSyncStarted = false;
 
   createContainer(): HTMLElement {
     let existing = document.getElementById(this.containerId) as HTMLElement | null;
@@ -69,11 +63,11 @@ export class TranslationOverlayManager {
       existing = document.createElement('div');
       existing.id = this.containerId;
       existing.style.cssText = [
-        'position:absolute',
+        'position:fixed',
         'top:0',
         'left:0',
-        'width:0',
-        'height:0',
+        'width:100vw',
+        'height:100vh',
         'pointer-events:none',
         'z-index:2147483646',
         'overflow:visible',
@@ -83,7 +77,27 @@ export class TranslationOverlayManager {
     }
 
     this.container = existing;
+    this.startAutoSync();
     return existing;
+  }
+
+  private startAutoSync(): void {
+    if (this.autoSyncStarted) return;
+    this.autoSyncStarted = true;
+
+    const schedule = () => this.schedulePositionSync();
+    window.addEventListener('scroll', schedule, { passive: true, capture: true });
+    window.addEventListener('resize', schedule, { passive: true });
+    window.setInterval(schedule, 350);
+  }
+
+  schedulePositionSync(): void {
+    if (this.syncScheduled) return;
+    this.syncScheduled = true;
+    window.requestAnimationFrame(() => {
+      this.syncScheduled = false;
+      this.updateOverlayPositions();
+    });
   }
 
   removeAllOverlays(): void {
@@ -114,6 +128,7 @@ export class TranslationOverlayManager {
       ids.push(this.renderPixivVisionItem(imageElement, item, config));
     }
 
+    this.updateOverlayPositions();
     console.log(`[Overlay] Pixiv 渲染完成: ${ids.length} 个覆盖层`);
     return ids;
   }
@@ -126,7 +141,65 @@ export class TranslationOverlayManager {
     const cfg: Required<RenderConfig> = { ...DEFAULT_RENDER_CONFIG, ...config };
     const container = this.container || this.createContainer();
     const id = `ml-overlay-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
-    const imageRect = getDocumentRect(imageElement);
+
+    const overlay = document.createElement('div');
+    overlay.id = id;
+    overlay.className = this.overlayClass;
+    overlay.textContent = item.translatedText;
+    overlay.dataset.original = item.sourceText || '';
+    overlay.style.cssText = [
+      'position:fixed',
+      'left:0',
+      'top:0',
+      'font-family:"PingFang SC","Microsoft YaHei","Noto Sans SC",sans-serif',
+      'line-height:1.35',
+      'margin:0',
+      'border-radius:3px',
+      'box-shadow:0 1px 3px rgba(0,0,0,0.12)',
+      'text-shadow:0 0 2px rgba(255,255,255,0.85)',
+      'word-break:break-word',
+      'overflow-wrap:anywhere',
+      'white-space:pre-wrap',
+      'text-align:center',
+      'display:flex',
+      'align-items:center',
+      'justify-content:center',
+      'box-sizing:border-box',
+      'pointer-events:none',
+      'writing-mode:horizontal-tb',
+      'transform:translateZ(0)'
+    ].join(';');
+
+    container.appendChild(overlay);
+    this.overlays.set(id, {
+      id,
+      translatedText: item.translatedText,
+      element: overlay,
+      imageElement,
+      item,
+      config: cfg
+    });
+
+    this.applyOverlayPosition(this.overlays.get(id)!);
+    return id;
+  }
+
+  updateOverlayPositions(): void {
+    for (const overlay of this.overlays.values()) {
+      this.applyOverlayPosition(overlay);
+    }
+  }
+
+  private applyOverlayPosition(overlay: TranslationOverlay): void {
+    const imageRect = overlay.imageElement.getBoundingClientRect();
+    const { item, config: cfg, element } = overlay;
+
+    if (imageRect.width <= 0 || imageRect.height <= 0 || imageRect.bottom < 0 || imageRect.top > window.innerHeight) {
+      element.style.display = 'none';
+      return;
+    }
+
+    element.style.display = 'flex';
     const [x1, y1, x2, y2] = item.bbox;
 
     let leftPx = imageRect.left + (x1 / 1000) * imageRect.width;
@@ -150,52 +223,17 @@ export class TranslationOverlayManager {
     leftPx = clamp(leftPx, imageRect.left, Math.max(imageRect.left, imageRect.right - widthPx));
     topPx = clamp(topPx, imageRect.top, Math.max(imageRect.top, imageRect.bottom - heightPx));
 
-    const overlay = document.createElement('div');
-    overlay.id = id;
-    overlay.className = this.overlayClass;
-    overlay.textContent = text;
-    overlay.dataset.original = item.sourceText || '';
-
     const bgWithOpacity = hexToRgba(cfg.background, cfg.backgroundOpacity);
     const fontSize = clamp(Math.round(Math.min(cfg.fontSize, widthPx / Math.max(4, Math.min(8, text.length)))), 10, cfg.fontSize);
 
-    overlay.style.cssText = [
-      'position:absolute',
-      `left:${leftPx}px`,
-      `top:${topPx}px`,
-      `width:${widthPx}px`,
-      `min-height:${heightPx}px`,
-      `font-family:"PingFang SC","Microsoft YaHei","Noto Sans SC",sans-serif`,
-      `font-size:${fontSize}px`,
-      'line-height:1.35',
-      `color:${cfg.color}`,
-      `background:${bgWithOpacity}`,
-      `padding:${cfg.padding}px`,
-      'margin:0',
-      'border-radius:3px',
-      'box-shadow:0 1px 3px rgba(0,0,0,0.12)',
-      'text-shadow:0 0 2px rgba(255,255,255,0.85)',
-      'word-break:break-word',
-      'overflow-wrap:anywhere',
-      'white-space:pre-wrap',
-      'text-align:center',
-      'display:flex',
-      'align-items:center',
-      'justify-content:center',
-      'box-sizing:border-box',
-      'pointer-events:none',
-      'writing-mode:horizontal-tb'
-    ].join(';');
-
-    container.appendChild(overlay);
-    this.overlays.set(id, {
-      id,
-      translatedText: text,
-      element: overlay,
-      imageElement
-    });
-
-    return id;
+    element.style.left = `${leftPx}px`;
+    element.style.top = `${topPx}px`;
+    element.style.width = `${widthPx}px`;
+    element.style.minHeight = `${heightPx}px`;
+    element.style.fontSize = `${fontSize}px`;
+    element.style.color = cfg.color;
+    element.style.background = bgWithOpacity;
+    element.style.padding = `${cfg.padding}px`;
   }
 
   getOverlayCount(): number {
