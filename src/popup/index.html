@@ -5,39 +5,18 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>MangaLens</title>
   <style>
-    * {
-      box-sizing: border-box;
-      margin: 0;
-      padding: 0;
-    }
-
+    * { box-sizing: border-box; margin: 0; padding: 0; }
     body {
       width: 360px;
-      min-height: 500px;
+      min-height: 440px;
       font-family: "Microsoft YaHei", "PingFang SC", sans-serif;
       background: #f4f6fb;
       color: #1f2937;
     }
-
-    .container {
-      padding: 16px;
-    }
-
-    .header {
-      margin-bottom: 14px;
-    }
-
-    .header h1 {
-      font-size: 22px;
-      font-weight: 700;
-    }
-
-    .header p {
-      margin-top: 4px;
-      color: #64748b;
-      font-size: 12px;
-    }
-
+    .container { padding: 16px; }
+    .header { margin-bottom: 14px; }
+    .header h1 { font-size: 22px; font-weight: 700; }
+    .header p { margin-top: 4px; color: #64748b; font-size: 12px; line-height: 1.45; }
     .card {
       background: #ffffff;
       border: 1px solid #e5e7eb;
@@ -45,29 +24,10 @@
       padding: 14px;
       margin-bottom: 12px;
     }
-
-    .card-title {
-      font-size: 14px;
-      font-weight: 700;
-      margin-bottom: 10px;
-    }
-
-    .toggle-row {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-    }
-
-    .toggle {
-      position: relative;
-      width: 46px;
-      height: 24px;
-    }
-
-    .toggle input {
-      opacity: 0;
-    }
-
+    .card-title { font-size: 14px; font-weight: 700; margin-bottom: 10px; }
+    .toggle-row { display: flex; align-items: center; justify-content: space-between; }
+    .toggle { position: relative; width: 46px; height: 24px; }
+    .toggle input { opacity: 0; }
     .toggle-slider {
       position: absolute;
       inset: 0;
@@ -76,7 +36,6 @@
       border-radius: 999px;
       transition: 0.2s;
     }
-
     .toggle-slider::before {
       content: "";
       position: absolute;
@@ -89,52 +48,14 @@
       transition: 0.2s;
       box-shadow: 0 1px 3px rgba(15, 23, 42, 0.25);
     }
-
-    .toggle input:checked + .toggle-slider {
-      background: #2563eb;
-    }
-
-    .toggle input:checked + .toggle-slider::before {
-      transform: translateX(22px);
-    }
-
-    .status {
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 8px;
-      margin-top: 12px;
-    }
-
-    .status-item {
-      padding: 10px;
-      background: #f8fafc;
-      border-radius: 6px;
-      text-align: center;
-    }
-
-    .status-value {
-      color: #2563eb;
-      font-size: 18px;
-      font-weight: 700;
-    }
-
-    .status-label {
-      color: #64748b;
-      font-size: 11px;
-      margin-top: 2px;
-    }
-
-    .form-group {
-      margin-bottom: 10px;
-    }
-
-    .form-label {
-      display: block;
-      color: #475569;
-      font-size: 12px;
-      margin-bottom: 4px;
-    }
-
+    .toggle input:checked + .toggle-slider { background: #2563eb; }
+    .toggle input:checked + .toggle-slider::before { transform: translateX(22px); }
+    .status { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 12px; }
+    .status-item { padding: 10px; background: #f8fafc; border-radius: 6px; text-align: center; }
+    .status-value { color: #2563eb; font-size: 18px; font-weight: 700; }
+    .status-label { color: #64748b; font-size: 11px; margin-top: 2px; }
+    .form-group { margin-bottom: 10px; }
+    .form-label { display: block; color: #475569; font-size: 12px; margin-bottom: 4px; }
     .form-input {
       width: 100%;
       min-height: 36px;
@@ -143,20 +64,12 @@
       border-radius: 6px;
       font-size: 13px;
     }
-
     .form-input:focus {
       outline: none;
       border-color: #2563eb;
       box-shadow: 0 0 0 2px rgba(37, 99, 235, 0.12);
     }
-
-    .form-hint {
-      margin-top: 4px;
-      color: #64748b;
-      font-size: 11px;
-      line-height: 1.45;
-    }
-
+    .form-hint { margin-top: 4px; color: #64748b; font-size: 11px; line-height: 1.45; }
     .btn {
       width: 100%;
       min-height: 38px;
@@ -166,69 +79,28 @@
       font-weight: 600;
       cursor: pointer;
     }
-
-    .btn-primary {
-      background: #2563eb;
-      color: white;
-    }
-
-    .btn-secondary {
-      margin-top: 8px;
-      background: #e5e7eb;
-      color: #334155;
-    }
-
-    .btn-row {
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 8px;
-    }
-
-    .btn-row .btn-secondary {
-      margin-top: 0;
-    }
-
-    .alert {
-      padding: 8px 10px;
-      border-radius: 6px;
-      font-size: 12px;
-      margin-bottom: 10px;
-    }
-
-    .alert-success {
-      background: #dcfce7;
-      color: #166534;
-    }
-
-    .alert-error {
-      background: #fee2e2;
-      color: #991b1b;
-    }
-
-    .alert-warning {
-      background: #fef3c7;
-      color: #92400e;
-    }
-
-    .footer {
-      color: #64748b;
-      font-size: 11px;
-      text-align: center;
-      padding: 8px 0;
-    }
+    .btn-primary { background: #2563eb; color: white; }
+    .btn-secondary { margin-top: 8px; background: #e5e7eb; color: #334155; }
+    .btn-row { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+    .btn-row .btn-secondary { margin-top: 0; }
+    .alert { padding: 8px 10px; border-radius: 6px; font-size: 12px; margin-bottom: 10px; }
+    .alert-success { background: #dcfce7; color: #166534; }
+    .alert-error { background: #fee2e2; color: #991b1b; }
+    .alert-warning { background: #fef3c7; color: #92400e; }
+    .footer { color: #64748b; font-size: 11px; text-align: center; padding: 8px 0; line-height: 1.45; }
   </style>
 </head>
 <body>
   <div class="container">
     <div class="header">
       <h1>MangaLens</h1>
-      <p>漫画实时翻译器 · 智谱 API</p>
+      <p>Pixiv 漫画实时翻译器 · 只从 Pixiv HTML 漫画容器选图 · GLM-4.6V 一次完成识别和翻译</p>
     </div>
 
     <div class="card">
       <div class="card-title">状态</div>
       <div class="toggle-row">
-        <span>开启翻译</span>
+        <span>开启 Pixiv 翻译</span>
         <label class="toggle">
           <input type="checkbox" id="toggleEnabled" checked>
           <span class="toggle-slider"></span>
@@ -237,7 +109,7 @@
       <div class="status">
         <div class="status-item">
           <div class="status-value" id="processedCount">0</div>
-          <div class="status-label">已处理图片</div>
+          <div class="status-label">已处理漫画页</div>
         </div>
         <div class="status-item">
           <div class="status-value" id="cacheCount">0</div>
@@ -247,7 +119,7 @@
     </div>
 
     <div class="card">
-      <div class="card-title">智谱 API 配置</div>
+      <div class="card-title">智谱视觉模型配置</div>
       <div id="alertContainer"></div>
 
       <div class="form-group">
@@ -257,28 +129,24 @@
       </div>
 
       <div class="form-group">
-        <label class="form-label" for="zhipuTranslationModel">翻译模型</label>
-        <input type="text" class="form-input" id="zhipuTranslationModel" value="glm-4.7">
-      </div>
-
-      <div class="form-group">
-        <label class="form-label" for="zhipuOcrModel">OCR 模型</label>
-        <input type="text" class="form-input" id="zhipuOcrModel" value="glm-ocr" readonly>
+        <label class="form-label" for="zhipuVisionModel">视觉翻译模型</label>
+        <input type="text" class="form-input" id="zhipuVisionModel" value="glm-4.6v">
+        <p class="form-hint">OCR 与翻译统一走这个视觉模型，不再使用截图 OCR 或双模型链路。</p>
       </div>
 
       <div class="btn-row">
         <button class="btn btn-primary" id="btnSave">保存配置</button>
-        <button class="btn btn-secondary" id="btnTest">测试连接</button>
+        <button class="btn btn-secondary" id="btnTest">测试配置</button>
       </div>
     </div>
 
     <div class="card">
       <div class="card-title">操作</div>
-      <button class="btn btn-primary" id="btnRefresh">刷新页面翻译</button>
-      <button class="btn btn-secondary" id="btnSelect">手动选择图片</button>
+      <button class="btn btn-primary" id="btnRefresh">重新定位当前 Pixiv 漫画页</button>
+      <button class="btn btn-secondary" id="btnSelect">翻译当前可见漫画页</button>
     </div>
 
-    <div class="footer">v3.1 · GLM-OCR + GLM-4.7</div>
+    <div class="footer">v4.0 · Pixiv HTML DOM + GLM-4.6V</div>
   </div>
 
   <script src="../../popup.js"></script>
