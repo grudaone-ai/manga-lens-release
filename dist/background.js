@@ -100,7 +100,7 @@ var MangaLensBackground = (() => {
     const options = {
       mode: "cors",
       credentials: "omit",
-      cache: "default"
+      cache: "force-cache"
     };
     if (!pageUrl) return options;
     try {
@@ -122,8 +122,17 @@ var MangaLensBackground = (() => {
       return options;
     }
   }
+  async function fetchWithTimeout(url, options, timeoutMs = 15e3) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      return await fetch(url, { ...options, signal: controller.signal });
+    } finally {
+      clearTimeout(timer);
+    }
+  }
   async function fetchImageAsBase64(imageUrl, pageUrl) {
-    const response = await fetch(imageUrl, buildFetchOptions(imageUrl, pageUrl));
+    const response = await fetchWithTimeout(imageUrl, buildFetchOptions(imageUrl, pageUrl));
     if (!response.ok) {
       throw new Error(`\u56FE\u7247\u83B7\u53D6\u5931\u8D25: HTTP ${response.status}`);
     }
@@ -134,12 +143,31 @@ var MangaLensBackground = (() => {
       binary += String.fromCharCode(bytes[index]);
     }
     const contentType = response.headers.get("content-type") || "image/jpeg";
-    return `data:${contentType};base64,${btoa(binary)}`;
+    return { base64: `data:${contentType};base64,${btoa(binary)}`, contentType };
   }
-  function captureVisibleTab() {
+  function queryActiveTab() {
+    return new Promise((resolve) => {
+      chrome.tabs.query({ active: true, currentWindow: true }, ([tab]) => resolve(tab || null));
+    });
+  }
+  function isCropVisible(cropRect, viewport) {
+    if (cropRect.width <= 0 || cropRect.height <= 0) return false;
+    const viewportWidth = Number(viewport?.width) || 0;
+    const viewportHeight = Number(viewport?.height) || 0;
+    if (!viewportWidth || !viewportHeight) return true;
+    return cropRect.left < viewportWidth && cropRect.top < viewportHeight && cropRect.left + cropRect.width > 0 && cropRect.top + cropRect.height > 0;
+  }
+  async function captureVisibleTab(expectedTabId, cropRect, viewport) {
+    const activeTab = await queryActiveTab();
+    if (expectedTabId && activeTab?.id !== expectedTabId) {
+      throw new Error("\u5F53\u524D\u6807\u7B7E\u9875\u5DF2\u5207\u6362\uFF0C\u5DF2\u53D6\u6D88\u622A\u56FE OCR\uFF0C\u907F\u514D\u8BC6\u522B\u5230\u9519\u8BEF\u6807\u7B7E\u9875");
+    }
+    if (cropRect && !isCropVisible(cropRect, viewport)) {
+      throw new Error("\u56FE\u7247\u4E0D\u5728\u5F53\u524D\u53EF\u89C1\u533A\u57DF\uFF0C\u5DF2\u8DF3\u8FC7\u622A\u56FE OCR");
+    }
     return new Promise((resolve, reject) => {
       captureQueue = captureQueue.then(async () => {
-        const waitMs = Math.max(0, 700 - (Date.now() - lastCaptureAt));
+        const waitMs = Math.max(0, 900 - (Date.now() - lastCaptureAt));
         if (waitMs > 0) {
           await new Promise((done) => setTimeout(done, waitMs));
         }
@@ -187,8 +215,8 @@ var MangaLensBackground = (() => {
     }
     return `data:image/png;base64,${btoa(binary)}`;
   }
-  async function captureAndRecognizeVisibleImage(cropRect, devicePixelRatio, apiKey, model) {
-    const screenshot = await captureVisibleTab();
+  async function captureAndRecognizeVisibleImage(cropRect, devicePixelRatio, apiKey, model, tabId, viewport) {
+    const screenshot = await captureVisibleTab(tabId, cropRect, viewport);
     const croppedImage = await cropCapturedImage(screenshot, cropRect, devicePixelRatio);
     return recognizeWithZhipuOCR(croppedImage, apiKey, model);
   }
@@ -201,7 +229,7 @@ var MangaLensBackground = (() => {
       });
     });
   });
-  chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+  chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (message.target !== "background") {
       return true;
     }
@@ -219,8 +247,8 @@ var MangaLensBackground = (() => {
       case "FETCH_IMAGE_AS_BASE64":
         (async () => {
           try {
-            const base64 = await fetchImageAsBase64(message.imageUrl, message.pageUrl);
-            sendResponse({ success: true, base64 });
+            const result = await fetchImageAsBase64(message.imageUrl, message.pageUrl);
+            sendResponse({ success: true, base64: result.base64, contentType: result.contentType });
           } catch (error) {
             sendResponse({
               success: false,
@@ -229,18 +257,41 @@ var MangaLensBackground = (() => {
           }
         })();
         return true;
-      case "TEST_ZHIPU_OCR":
+      case "RECOGNIZE_ZHIPU_OCR_BASE64":
         (async () => {
           try {
-            const testImageBase64 = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAoAAAAKCAYAAACNMs+9AAAAFUlEQVR42mP8z8BQDwADhQGAWjR9awAAAABJRU5ErkJggg==";
             const result = await recognizeWithZhipuOCR(
-              testImageBase64,
+              message.imageBase64,
               message.apiKey,
               message.model || "glm-ocr"
             );
             sendResponse({
               success: true,
-              message: `\u667A\u8C31 OCR \u8FDE\u63A5\u6210\u529F\uFF0C\u8BC6\u522B\u5230 ${result.items.length} \u4E2A\u6587\u672C\u533A\u57DF`,
+              text: result.text,
+              items: result.items,
+              requestId: result.requestId,
+              source: message.source || "element-canvas",
+              sourceWidth: message.sourceWidth,
+              sourceHeight: message.sourceHeight,
+              sourceMessage: message.sourceMessage
+            });
+          } catch (error) {
+            sendResponse({
+              success: false,
+              source: message.source || "element-canvas",
+              message: error instanceof Error ? error.message : "\u667A\u8C31 OCR \u8BC6\u522B\u5931\u8D25"
+            });
+          }
+        })();
+        return true;
+      case "TEST_ZHIPU_OCR":
+        (async () => {
+          try {
+            const testImageBase64 = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAPAAAABQCAIAAACoK28rAAAEdklEQVR4nO3dPUh6XxzH8dsDhRIIgmUJtQQG0QPdIexBr1l3aS1bKiNoiZqiWoKWQCRoKBoqUNsighwqTCMosqKhwaWhNqPggj1QWFp5/sOFi/Sz/v3+/uD/88vnNZ17POd4L7x7wIZyGGMcABW5//cNAPxJCBpIQdBACoIGUhA0kIKggRQEDaQgaCAFQQMpCBpIQdBACoIGUhA0kIKggRQEDaQgaCAFQQMpCBpIQdBACoIGUhA0kIKggRQEDaQgaCAFQQMpCBpIyTRoj8fD87zJZOJ5fnV1VZ5cWVlpaGiwWCydnZ2RSESeVKvVgiBYLJaGhoaDgwN5cnNzUxAEQRDy8/PlwcbGhrxSNjc3x3Hc+fm5KIpWq7WjoyMSiaTdJR/48PAwMDCg0WiUO3S73a2trfX19YFAgOO4WCzW09MjCALP89vb2xk+Pvx1WAb8fn9zc/P9/T1j7P7+vrm5ORgMBgIBq9Uai8UYYzs7O21tbfJijUYjD8LhcE1NzaejlFc/jWV1dXWRSIQxtrGxYbfbv1nZ0tIyPz+vzEuSZDabPz4+Li4uqqqqGGMul2t2dpYxdnNzU1FR8Z+eG/5eGQVts9mOj4+Vy1Ao1N7eLoriycmJMjk0NJRIJFhKfMlkUqvVfjrq+6BLS0svLy8ZY4lE4vDw8JuVt7e3qfMXFxfr6+uMsefnZ51Oxxi7u7uLx+OMsWAwWFlZ+TuPC1kgo6DLyspeXl6Uy5eXl7KyMoPB8Pr6+utiJTK/39/V1fXVqyxdph6PR6/XDw4O7u/vf7Xr+3mv1zs4OKhc9vb2qtXqvb29tNshe/3JoGOxmMFg0Ov1aYNWqVQWi6WpqUmr1crfR1OlJiivlCk/Ae7u7txud21t7fT0dNpdX53GGLu6uqqurpYkKXXS5/P19fX96zNCdsko6Pb29lAopFweHR2Jomg2m09PT+WZZDLZ398vj5XIXC6X0+n8dNQ336ElSVLeRZKkkpKSr1amnX96euJ5XrmlkZGRt7c3xtj7+/uvv/lAtsvoU47x8fGJiYnHx0eO4x4eHiYnJycmJoaHh6empuLxOMdxa2tr8iBVR0fH2dnZz98lJyfHbrfLn5ZEo9Hy8vKf72WMORyOsbGxxsZGeebx8dHn83Ecd3x8bDQaf34UZIX8TDaLonh9fW21WgsLCxOJxOjoqM1m4zju8vKS53mdTldcXLy4uPhpl9FoDIfDyWQyNzf9l1MikRAEQR6bTCan07m8vNzd3a1SqfLy8txu98/v0Ov17u7uRqPRpaWloqKira2tmZkZh8OxsLBQUFDwW0dBVshh+JcUQAj+UgikIGggBUEDKQgaSEHQQAqCBlIQNJCCoIEUBA2kIGggBUEDKQgaSEHQQAqCBlIQNJCCoIEUBA2kIGggBUEDKQgaSEHQQAqCBlIQNJCCoIEUBA2kIGggBUEDKQgaSEHQQAqCBlIQNJCCoIEUBA2kIGggBUEDKQgaSEHQQAqCBlIQNJCCoIEUBA2kIGggBUEDKQgaSPkHsXrIuAOLC/QAAAAASUVORK5CYII=";
+            const result = await recognizeWithZhipuOCR(testImageBase64, message.apiKey, message.model || "glm-ocr");
+            sendResponse({
+              success: true,
+              message: `\u667A\u8C31 OCR \u8FDE\u63A5\u6210\u529F\uFF0C\u8BC6\u522B\u5230 ${result.items.length} \u4E2A\u6587\u672C\u533A\u57DF${result.text ? `\uFF1A${result.text.slice(0, 30)}` : ""}`,
               requestId: result.requestId
             });
           } catch (error) {
@@ -256,10 +307,11 @@ var MangaLensBackground = (() => {
           try {
             let imageBase64;
             try {
-              imageBase64 = await fetchImageAsBase64(message.imageUrl, message.pageUrl);
+              const fetched = await fetchImageAsBase64(message.imageUrl, message.pageUrl);
+              imageBase64 = fetched.base64;
             } catch (error) {
               const messageText = error instanceof Error ? error.message : String(error);
-              const isForbidden = messageText.includes("HTTP 403");
+              const isForbidden = messageText.includes("HTTP 403") || messageText.includes("Failed to fetch");
               if (!isForbidden || !message.cropRect) {
                 throw error;
               }
@@ -267,13 +319,22 @@ var MangaLensBackground = (() => {
                 message.cropRect,
                 message.devicePixelRatio || 1,
                 message.apiKey,
-                message.model || "glm-ocr"
+                message.model || "glm-ocr",
+                sender.tab?.id,
+                {
+                  width: Number(message.viewportWidth) || void 0,
+                  height: Number(message.viewportHeight) || void 0
+                }
               );
               sendResponse({
                 success: true,
                 text: fallbackResult.text,
                 items: fallbackResult.items,
                 requestId: fallbackResult.requestId,
+                source: "visible-tab-capture",
+                sourceWidth: Math.round(message.cropRect.width * (message.devicePixelRatio || 1)),
+                sourceHeight: Math.round(message.cropRect.height * (message.devicePixelRatio || 1)),
+                sourceMessage: `background fetch \u5931\u8D25: ${messageText}\uFF1B\u5DF2\u56DE\u9000\u622A\u56FE OCR`,
                 fallback: "visible-tab-capture"
               });
               return;
@@ -287,11 +348,14 @@ var MangaLensBackground = (() => {
               success: true,
               text: result.text,
               items: result.items,
-              requestId: result.requestId
+              requestId: result.requestId,
+              source: "background-fetch",
+              sourceMessage: "\u5DF2\u901A\u8FC7 background fetch \u83B7\u53D6\u56FE\u7247 URL"
             });
           } catch (error) {
             sendResponse({
               success: false,
+              source: "background-fetch",
               message: error instanceof Error ? error.message : "\u667A\u8C31 OCR \u8BC6\u522B\u5931\u8D25"
             });
           }

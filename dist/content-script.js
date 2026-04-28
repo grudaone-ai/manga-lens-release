@@ -2,7 +2,7 @@
 var MangaLensContent = (() => {
   // src/modules/image-detector.ts
   var EXCLUDED_PATTERNS = [
-    /\.gif$/i,
+    /\.gif(?:\?|#|$)/i,
     /doubleclick\.net/i,
     /googlesyndication\.com/i,
     /googleadservices\.com/i,
@@ -14,12 +14,46 @@ var MangaLensContent = (() => {
     /spacer\.gif/i,
     /transparent\.png/i,
     /icon-/i,
-    /social-/i
+    /social-/i,
+    /avatar/i,
+    /profile/i
   ];
+  var PIXIV_IMAGE_HOST = /(?:^|\.)pximg\.net$/i;
+  function isPixivPage() {
+    return /(?:^|\.)pixiv\.net$/i.test(location.hostname);
+  }
+  function normalizeImageUrl(src) {
+    if (!src) return "";
+    try {
+      return new URL(src, location.href).href;
+    } catch {
+      return src;
+    }
+  }
+  function getLargestSrcFromSrcset(srcset) {
+    if (!srcset) return "";
+    const candidates = srcset.split(",").map((entry) => entry.trim()).map((entry) => {
+      const [url, descriptor] = entry.split(/\s+/);
+      const weight = descriptor?.endsWith("w") ? Number.parseInt(descriptor, 10) : descriptor?.endsWith("x") ? Number.parseFloat(descriptor) * 1e3 : 0;
+      return { url, weight: Number.isFinite(weight) ? weight : 0 };
+    }).filter((entry) => !!entry.url).sort((a, b) => b.weight - a.weight);
+    return candidates[0]?.url || "";
+  }
   function shouldExcludeImage(src, width, height) {
     if (!src) return true;
+    const normalized = normalizeImageUrl(src);
+    const isPixivImage = (() => {
+      try {
+        return PIXIV_IMAGE_HOST.test(new URL(normalized).hostname);
+      } catch {
+        return /pximg\.net/i.test(normalized);
+      }
+    })();
+    if (isPixivPage() && isPixivImage) {
+      return width < 180 || height < 180;
+    }
     if (width < 100 || height < 100) return true;
-    return EXCLUDED_PATTERNS.some((pattern) => pattern.test(src));
+    return EXCLUDED_PATTERNS.some((pattern) => pattern.test(normalized));
   }
   function getElementPosition(element) {
     const rect = element.getBoundingClientRect();
@@ -30,35 +64,38 @@ var MangaLensContent = (() => {
       height: rect.height
     };
   }
+  function getImageSrc(img) {
+    const source = img.closest("picture")?.querySelector("source");
+    return normalizeImageUrl(
+      img.currentSrc || getLargestSrcFromSrcset(img.srcset) || img.src || img.dataset.src || img.dataset.lazySrc || img.dataset.original || getLargestSrcFromSrcset(source?.srcset) || ""
+    );
+  }
   var ImageDetector = class {
     detectMangaImages() {
       const detected = [];
       const seen = /* @__PURE__ */ new Set();
-      document.querySelectorAll("img").forEach((img) => {
-        const info = this.analyzeImage(img);
+      const push = (info) => {
         if (!info || seen.has(info.src)) return;
         seen.add(info.src);
         detected.push(info);
-      });
-      document.querySelectorAll('[style*="background"], [data-src], picture, figure').forEach((element) => {
-        const info = this.analyzeElement(element);
-        if (!info || seen.has(info.src)) return;
-        seen.add(info.src);
-        detected.push(info);
-      });
+      };
+      document.querySelectorAll("img").forEach((img) => push(this.analyzeImage(img)));
+      document.querySelectorAll('[style*="background"], [data-src], [data-lazy-src], [data-original], picture, figure').forEach((element) => push(this.analyzeElement(element)));
       console.log(`[MangaLens] \u68C0\u6D4B\u5230 ${detected.length} \u5F20\u5019\u9009\u56FE\u7247`);
       return detected;
     }
     analyzeImage(img) {
       const rect = img.getBoundingClientRect();
-      const src = img.currentSrc || img.src || img.dataset.src || img.dataset.lazySrc || "";
-      if (rect.width <= 0 || rect.height <= 0) return null;
-      if (shouldExcludeImage(src, rect.width, rect.height)) return null;
+      const width = rect.width || img.naturalWidth || img.width;
+      const height = rect.height || img.naturalHeight || img.height;
+      const src = getImageSrc(img);
+      if (width <= 0 || height <= 0) return null;
+      if (shouldExcludeImage(src, width, height)) return null;
       return {
         element: img,
         src,
         position: getElementPosition(img),
-        aspectRatio: rect.height / rect.width,
+        aspectRatio: height / width,
         isManga: true
       };
     }
@@ -67,20 +104,20 @@ var MangaLensContent = (() => {
       if (rect.width <= 0 || rect.height <= 0) return null;
       let src = "";
       if (element instanceof HTMLImageElement) {
-        src = element.currentSrc || element.src;
-      } else if (element.dataset.src) {
-        src = element.dataset.src;
+        src = getImageSrc(element);
+      } else if (element.dataset.src || element.dataset.lazySrc || element.dataset.original) {
+        src = normalizeImageUrl(element.dataset.src || element.dataset.lazySrc || element.dataset.original || "");
       } else if (element.style.backgroundImage) {
         const match = element.style.backgroundImage.match(/url\(["']?([^"')]+)["']?\)/);
-        if (match) src = match[1];
+        if (match) src = normalizeImageUrl(match[1]);
       }
       if (!src) {
         const img = element.querySelector("img");
-        src = img?.currentSrc || img?.src || img?.dataset.src || "";
+        if (img) src = getImageSrc(img);
       }
       if (!src) {
         const source = element.querySelector("source");
-        src = source?.srcset?.split(" ")[0] || "";
+        src = normalizeImageUrl(getLargestSrcFromSrcset(source?.srcset));
       }
       if (shouldExcludeImage(src, rect.width, rect.height)) return null;
       return {
@@ -136,29 +173,38 @@ var MangaLensContent = (() => {
       });
     }
     observeNewImages(callback) {
+      let debounceTimer;
+      const flush = () => {
+        window.clearTimeout(debounceTimer);
+        debounceTimer = window.setTimeout(() => {
+          const images = this.detectMangaImages();
+          if (images.length > 0) callback(images);
+        }, 350);
+      };
       const observer = new MutationObserver((mutations) => {
-        const images = [];
+        let shouldScan = false;
         for (const mutation of mutations) {
-          mutation.addedNodes.forEach((node) => {
-            if (!(node instanceof HTMLElement)) return;
-            if (node instanceof HTMLImageElement) {
-              const info = this.analyzeImage(node);
-              if (info) images.push(info);
-              return;
-            }
-            node.querySelectorAll("img").forEach((img) => {
-              const info = this.analyzeImage(img);
-              if (info) images.push(info);
-            });
-          });
+          if (mutation.type === "childList" && mutation.addedNodes.length > 0) {
+            shouldScan = true;
+            break;
+          }
+          if (mutation.type === "attributes" && mutation.target instanceof HTMLElement && ["src", "srcset", "style", "data-src", "data-lazy-src", "data-original"].includes(mutation.attributeName || "")) {
+            shouldScan = true;
+            break;
+          }
         }
-        if (images.length > 0) callback(images);
+        if (shouldScan) flush();
       });
       observer.observe(document.body, {
         childList: true,
-        subtree: true
+        subtree: true,
+        attributes: true,
+        attributeFilter: ["src", "srcset", "style", "data-src", "data-lazy-src", "data-original"]
       });
-      return () => observer.disconnect();
+      return () => {
+        window.clearTimeout(debounceTimer);
+        observer.disconnect();
+      };
     }
   };
   var imageDetector = new ImageDetector();
@@ -649,6 +695,65 @@ var MangaLensContent = (() => {
     }
   };
 
+  // src/modules/image-source.ts
+  var MAX_CANVAS_PIXELS = 5e6;
+  function getCanvasTargetSize(width, height) {
+    const safeWidth = Math.max(1, Math.round(width));
+    const safeHeight = Math.max(1, Math.round(height));
+    const pixels = safeWidth * safeHeight;
+    if (pixels <= MAX_CANVAS_PIXELS) {
+      return { width: safeWidth, height: safeHeight, scale: 1 };
+    }
+    const scale = Math.sqrt(MAX_CANVAS_PIXELS / pixels);
+    return {
+      width: Math.max(1, Math.round(safeWidth * scale)),
+      height: Math.max(1, Math.round(safeHeight * scale)),
+      scale
+    };
+  }
+  async function waitForImageDecode(imageElement) {
+    if (imageElement.complete && imageElement.naturalWidth > 0 && imageElement.naturalHeight > 0) return;
+    await Promise.race([
+      imageElement.decode?.().catch(() => void 0),
+      new Promise((resolve) => setTimeout(resolve, 2500))
+    ]);
+  }
+  async function captureImageElementAsBase64(imageElement) {
+    await waitForImageDecode(imageElement);
+    const naturalWidth = imageElement.naturalWidth || imageElement.width || imageElement.clientWidth;
+    const naturalHeight = imageElement.naturalHeight || imageElement.height || imageElement.clientHeight;
+    if (!naturalWidth || !naturalHeight) {
+      throw new Error("\u9875\u9762\u56FE\u7247\u5C1A\u672A\u5B8C\u6210\u52A0\u8F7D\uFF0C\u65E0\u6CD5\u4ECE HTMLImageElement \u8BFB\u53D6\u5C3A\u5BF8");
+    }
+    const target = getCanvasTargetSize(naturalWidth, naturalHeight);
+    const canvas = document.createElement("canvas");
+    canvas.width = target.width;
+    canvas.height = target.height;
+    const context = canvas.getContext("2d", { willReadFrequently: false });
+    if (!context) {
+      throw new Error("\u65E0\u6CD5\u521B\u5EFA Canvas \u4EE5\u8BFB\u53D6\u9875\u9762\u56FE\u7247");
+    }
+    context.drawImage(imageElement, 0, 0, target.width, target.height);
+    let base64;
+    try {
+      base64 = canvas.toDataURL("image/png");
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      throw new Error(`\u9875\u9762\u56FE\u7247 Canvas \u8BFB\u53D6\u5931\u8D25\uFF0C\u53EF\u80FD\u88AB\u8DE8\u57DF\u5B89\u5168\u7B56\u7565\u62E6\u622A: ${message}`);
+    }
+    if (!base64 || base64 === "data:,") {
+      throw new Error("\u9875\u9762\u56FE\u7247 Canvas \u5BFC\u51FA\u4E3A\u7A7A");
+    }
+    const scaleMessage = target.scale < 1 ? `\uFF0C\u4E3A\u63A7\u5236 OCR \u8D1F\u8F7D\u5DF2\u7F29\u653E\u5230 ${target.width}x${target.height}` : "";
+    return {
+      base64,
+      sourceWidth: target.width,
+      sourceHeight: target.height,
+      method: "element-canvas",
+      message: `\u5DF2\u76F4\u63A5\u8BFB\u53D6\u9875\u9762 HTML \u56FE\u7247 ${naturalWidth}x${naturalHeight}${scaleMessage}`
+    };
+  }
+
   // src/modules/ocr-engine.ts
   async function getExtensionConfig() {
     return new Promise((resolve) => {
@@ -662,6 +767,35 @@ var MangaLensContent = (() => {
           });
         }
       );
+    });
+  }
+  function getImageUrl(imageElement) {
+    return imageElement.currentSrc || imageElement.src || imageElement.dataset.src || imageElement.dataset.lazySrc || "";
+  }
+  function scaleResultToImageSize(result, fromWidth, fromHeight, toWidth, toHeight) {
+    if (!fromWidth || !fromHeight || fromWidth === toWidth && fromHeight === toHeight) return result;
+    const scaleX = toWidth / fromWidth;
+    const scaleY = toHeight / fromHeight;
+    return {
+      ...result,
+      boxes: result.boxes.map((box) => ({
+        ...box,
+        x: box.x * scaleX,
+        y: box.y * scaleY,
+        width: box.width * scaleX,
+        height: box.height * scaleY
+      }))
+    };
+  }
+  function sendMessageToBackground(message) {
+    return new Promise((resolve, reject) => {
+      chrome.runtime.sendMessage(message, (response) => {
+        if (chrome.runtime.lastError) {
+          reject(new Error(chrome.runtime.lastError.message));
+          return;
+        }
+        resolve(response);
+      });
     });
   }
   var MangaOCR = class {
@@ -693,13 +827,62 @@ var MangaLensContent = (() => {
       if (!this.config.zhipuApiKey) {
         throw new Error("\u672A\u914D\u7F6E\u667A\u8C31 API Key\uFF0C\u8BF7\u5148\u5728\u6269\u5C55\u8BBE\u7F6E\u4E2D\u586B\u5199");
       }
-      const imageUrl = imageElement.src || imageElement.currentSrc;
+      const imageUrl = getImageUrl(imageElement);
       if (!imageUrl) {
         throw new Error("\u65E0\u6CD5\u83B7\u53D6\u56FE\u7247\u5730\u5740");
       }
-      return this.recognizeViaBackground(imageElement, imageUrl);
+      const warnings = [];
+      try {
+        return await this.recognizeViaElementCanvas(imageElement, warnings);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        warnings.push(`element-canvas \u5931\u8D25: ${message}`);
+        console.warn("[MangaLens] element-canvas OCR \u5931\u8D25\uFF0C\u5C1D\u8BD5 background fetch:", error);
+      }
+      return this.recognizeViaBackground(imageElement, imageUrl, warnings);
     }
-    async recognizeViaBackground(imageElement, imageUrl) {
+    async recognizeViaElementCanvas(imageElement, warnings) {
+      const captured = await captureImageElementAsBase64(imageElement);
+      const response = await sendMessageToBackground({
+        target: "background",
+        type: "RECOGNIZE_ZHIPU_OCR_BASE64",
+        imageBase64: captured.base64,
+        source: captured.method,
+        sourceWidth: captured.sourceWidth,
+        sourceHeight: captured.sourceHeight,
+        sourceMessage: captured.message,
+        apiKey: this.config.zhipuApiKey,
+        model: this.config.zhipuOcrModel
+      });
+      if (!response?.success) {
+        throw new Error(response?.message || "\u9875\u9762\u56FE\u7247 OCR \u8BC6\u522B\u5931\u8D25");
+      }
+      const naturalWidth = imageElement.naturalWidth || imageElement.width || captured.sourceWidth;
+      const naturalHeight = imageElement.naturalHeight || imageElement.height || captured.sourceHeight;
+      const sourceWidth = Number(response.sourceWidth) || captured.sourceWidth;
+      const sourceHeight = Number(response.sourceHeight) || captured.sourceHeight;
+      const ocrResult = convertZhipuOCRResultToOCRResult(
+        {
+          text: response.text || "",
+          items: response.items || [],
+          requestId: response.requestId,
+          raw: response
+        },
+        sourceWidth,
+        sourceHeight
+      );
+      const scaled = scaleResultToImageSize(ocrResult, sourceWidth, sourceHeight, naturalWidth, naturalHeight);
+      return {
+        ...scaled,
+        source: "element-canvas",
+        sourceMessage: response.sourceMessage || captured.message,
+        sourceWidth,
+        sourceHeight,
+        requestId: response.requestId,
+        warnings
+      };
+    }
+    async recognizeViaBackground(imageElement, imageUrl, warnings = []) {
       const rect = imageElement.getBoundingClientRect();
       const cropRect = {
         left: rect.left,
@@ -707,37 +890,45 @@ var MangaLensContent = (() => {
         width: rect.width,
         height: rect.height
       };
-      return new Promise((resolve, reject) => {
-        chrome.runtime.sendMessage(
-          {
-            target: "background",
-            type: "FETCH_IMAGE_AND_ZHIPU_OCR",
-            imageUrl,
-            pageUrl: window.location.href,
-            cropRect,
-            devicePixelRatio: window.devicePixelRatio || 1,
-            apiKey: this.config.zhipuApiKey,
-            model: this.config.zhipuOcrModel
-          },
-          (response) => {
-            if (!response?.success) {
-              reject(new Error(response?.message || "\u667A\u8C31 OCR \u8BC6\u522B\u5931\u8D25"));
-              return;
-            }
-            const ocrResult = convertZhipuOCRResultToOCRResult(
-              {
-                text: response.text || "",
-                items: response.items || [],
-                requestId: response.requestId,
-                raw: response
-              },
-              imageElement.naturalWidth || imageElement.width,
-              imageElement.naturalHeight || imageElement.height
-            );
-            resolve(ocrResult);
-          }
-        );
+      const response = await sendMessageToBackground({
+        target: "background",
+        type: "FETCH_IMAGE_AND_ZHIPU_OCR",
+        imageUrl,
+        pageUrl: window.location.href,
+        cropRect,
+        viewportWidth: window.innerWidth,
+        viewportHeight: window.innerHeight,
+        devicePixelRatio: window.devicePixelRatio || 1,
+        apiKey: this.config.zhipuApiKey,
+        model: this.config.zhipuOcrModel
       });
+      if (!response?.success) {
+        rejectWithWarnings(response?.message || "\u667A\u8C31 OCR \u8BC6\u522B\u5931\u8D25", warnings);
+      }
+      const naturalWidth = imageElement.naturalWidth || imageElement.width || Math.round(cropRect.width);
+      const naturalHeight = imageElement.naturalHeight || imageElement.height || Math.round(cropRect.height);
+      const sourceWidth = Number(response.sourceWidth) || naturalWidth;
+      const sourceHeight = Number(response.sourceHeight) || naturalHeight;
+      const ocrResult = convertZhipuOCRResultToOCRResult(
+        {
+          text: response.text || "",
+          items: response.items || [],
+          requestId: response.requestId,
+          raw: response
+        },
+        sourceWidth,
+        sourceHeight
+      );
+      const scaled = scaleResultToImageSize(ocrResult, sourceWidth, sourceHeight, naturalWidth, naturalHeight);
+      return {
+        ...scaled,
+        source: response.source || response.fallback || "background-fetch",
+        sourceMessage: response.sourceMessage,
+        sourceWidth,
+        sourceHeight,
+        requestId: response.requestId,
+        warnings
+      };
     }
     async recognizeAndMerge(imageElement, mergerConfig) {
       const rawResult = await this.recognize(imageElement);
@@ -805,317 +996,196 @@ var MangaLensContent = (() => {
       };
     }
   };
+  function rejectWithWarnings(message, warnings) {
+    const detail = warnings.length > 0 ? `\uFF1B\u6B64\u524D\u5C1D\u8BD5: ${warnings.join("\uFF1B")}` : "";
+    throw new Error(`${message}${detail}`);
+  }
   var mangaOCR = new MangaOCR();
 
   // src/modules/translation-overlay.ts
   var DEFAULT_RENDER_CONFIG = {
-    horizontalText: false,
-    // 改为竖排（与日语原文一致）
+    horizontalText: true,
     fontSize: 14,
     color: "#000000",
     background: "#FFFFFF",
-    backgroundOpacity: 0.88,
-    padding: 4,
+    backgroundOpacity: 0.86,
+    padding: 3,
     maxLines: 10
   };
+  function clamp(value, min, max) {
+    if (!Number.isFinite(value)) return min;
+    return Math.max(min, Math.min(max, value));
+  }
+  function getDocumentRect(element) {
+    const rect = element.getBoundingClientRect();
+    return new DOMRect(
+      rect.left + window.scrollX,
+      rect.top + window.scrollY,
+      rect.width,
+      rect.height
+    );
+  }
+  function getImageNaturalSize(imageElement) {
+    return {
+      width: imageElement.naturalWidth || imageElement.width || imageElement.clientWidth || 1,
+      height: imageElement.naturalHeight || imageElement.height || imageElement.clientHeight || 1
+    };
+  }
+  function getDialogBounds(dialog) {
+    return dialog.bubbleBounds?.clipped || dialog.bubbleBounds?.padded || dialog.bubbleBounds?.raw || dialog.boundingBox;
+  }
   var TranslationOverlayManager = class {
     container = null;
     overlays = /* @__PURE__ */ new Map();
     containerId = "manga-lens-overlay-container";
     overlayClass = "manga-lens-text-overlay";
-    // 图片边界追踪（以图片元素为单位）
-    imageBoundsMap = /* @__PURE__ */ new Map();
-    /**
-     * 创建或获取覆盖层容器
-     */
-    createContainer(parent) {
-      this.removeContainer();
-      this.container = document.createElement("div");
-      this.container.id = this.containerId;
-      this.container.style.cssText = `
-      position: absolute;
-      top: 0;
-      left: 0;
-      width: 100%;
-      height: 100%;
-      pointer-events: none;
-      z-index: 999999;
-      overflow: hidden;
-    `;
-      const computedStyle = window.getComputedStyle(parent);
-      if (computedStyle.position === "static") {
-        parent.style.position = "relative";
+    createContainer(_parent) {
+      let existing = document.getElementById(this.containerId);
+      if (!existing) {
+        existing = document.createElement("div");
+        existing.id = this.containerId;
+        existing.style.cssText = [
+          "position:absolute",
+          "top:0",
+          "left:0",
+          "width:0",
+          "height:0",
+          "pointer-events:none",
+          "z-index:2147483646",
+          "overflow:visible",
+          "contain:layout style"
+        ].join(";");
+        document.body.appendChild(existing);
       }
-      parent.appendChild(this.container);
-      return this.container;
+      this.container = existing;
+      return existing;
     }
-    /**
-     * 渲染翻译文字
-     */
     renderTranslation(imageElement, box, translatedText) {
-      if (!this.container) {
-        this.createContainer(imageElement.parentElement);
-      }
-      const id = `ml-overlay-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
-      const boxRect = {
-        x: box.x / imageElement.naturalWidth * 100,
-        y: box.y / imageElement.naturalHeight * 100,
-        width: box.width / imageElement.naturalWidth * 100,
-        height: box.height / imageElement.naturalHeight * 100
-      };
-      const overlay = document.createElement("div");
-      overlay.id = id;
-      overlay.className = this.overlayClass;
-      overlay.textContent = translatedText;
-      const fontSize = Math.max(10, Math.min(box.height * 0.7, 18));
-      overlay.style.cssText = `
-      position: absolute;
-      left: ${boxRect.x}%;
-      top: ${boxRect.y}%;
-      width: ${boxRect.width}%;
-      min-height: ${boxRect.height}%;
-      ${box.isVertical ? "writing-mode: vertical-rl;" : "writing-mode: horizontal-tb;"}
-      font-family: "PingFang SC", "Microsoft YaHei", "Noto Sans SC", sans-serif;
-      font-size: ${fontSize}px;
-      line-height: 1.3;
-      color: #000000;
-      background: rgba(255, 255, 255, 0.88);
-      padding: 2px 4px;
-      margin: 0;
-      text-shadow: 0 0 2px rgba(255, 255, 255, 0.9);
-      box-shadow: 0 1px 2px rgba(0, 0, 0, 0.1);
-      border-radius: 2px;
-      word-break: break-all;
-      overflow-wrap: break-word;
-      white-space: pre-wrap;
-      text-align: center;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      transform: translateZ(0);
-      will-change: contents;
-    `;
-      this.container.appendChild(overlay);
-      this.overlays.set(id, {
-        id,
-        originalBox: box,
+      const dialog = {
+        id: Date.now(),
+        text: box.text,
+        items: [],
+        boundingBox: { x: box.x, y: box.y, width: box.width, height: box.height },
+        charCount: box.text.length,
+        charWidth: Math.max(8, box.width / Math.max(1, box.text.length)),
+        itemCharWidths: [],
         translatedText,
-        element: overlay
-      });
-      return id;
+        translationSuccess: true,
+        isVertical: box.isVertical
+      };
+      return this.renderMergedDialog(imageElement, dialog, { horizontalText: !box.isVertical });
     }
-    /**
-     * 批量渲染翻译
-     */
     renderBatch(imageElement, boxes, translations) {
       const ids = [];
       translations.forEach((translation, index) => {
         const box = boxes[index];
         if (box && translation) {
-          const id = this.renderTranslation(
-            imageElement,
-            box,
-            translation.translatedText
-          );
-          ids.push(id);
+          ids.push(this.renderTranslation(imageElement, box, translation.translatedText));
         }
       });
       return ids;
     }
-    /**
-     * 移除指定覆盖层
-     */
     removeOverlay(id) {
       const overlay = this.overlays.get(id);
-      if (overlay) {
-        overlay.element.remove();
-        this.overlays.delete(id);
-      }
+      if (!overlay) return;
+      overlay.element.remove();
+      this.overlays.delete(id);
     }
-    /**
-     * 移除所有覆盖层
-     */
     removeAllOverlays() {
-      this.overlays.forEach((overlay) => {
-        overlay.element.remove();
-      });
+      this.overlays.forEach((overlay) => overlay.element.remove());
       this.overlays.clear();
       this.removeContainer();
     }
-    /**
-     * 移除容器
-     */
     removeContainer() {
       const existing = document.getElementById(this.containerId);
-      if (existing) {
-        existing.remove();
-      }
+      existing?.remove();
       this.container = null;
     }
-    /**
-     * 获取当前覆盖层数量
-     */
     getOverlayCount() {
       return this.overlays.size;
     }
-    /**
-     * 检查是否有覆盖层
-     */
     hasOverlays() {
       return this.overlays.size > 0;
     }
-    /**
-     * 渲染翻译后的对话（新版）
-     * 
-     * 使用 MergedDialog 的 bubbleBounds 进行精确定位，
-     * 将横排译文渲染到原文位置。
-     */
+    removeOverlaysForImage(imageElement) {
+      for (const [id, overlay] of this.overlays.entries()) {
+        if (overlay.imageElement === imageElement) {
+          overlay.element.remove();
+          this.overlays.delete(id);
+        }
+      }
+    }
     renderMergedDialog(imageElement, dialog, config) {
-      const isVertical = dialog.isVertical !== void 0 ? dialog.isVertical : true;
-      const cfg = {
-        ...DEFAULT_RENDER_CONFIG,
-        ...config,
-        horizontalText: !isVertical
-        // isVertical=true → horizontalText=false
-      };
-      if (!this.container) {
-        this.createContainer(imageElement.parentElement);
+      const cfg = { ...DEFAULT_RENDER_CONFIG, ...config };
+      const container = this.container || this.createContainer();
+      const id = `ml-overlay-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+      const natural = getImageNaturalSize(imageElement);
+      const imageRect = getDocumentRect(imageElement);
+      const bounds = getDialogBounds(dialog);
+      const safeX = clamp(bounds.x, 0, natural.width);
+      const safeY = clamp(bounds.y, 0, natural.height);
+      const safeWidth = clamp(bounds.width, 1, natural.width - safeX || natural.width);
+      const safeHeight = clamp(bounds.height, 1, natural.height - safeY || natural.height);
+      const scaleX = imageRect.width / natural.width;
+      const scaleY = imageRect.height / natural.height;
+      let leftPx = imageRect.left + safeX * scaleX;
+      let topPx = imageRect.top + safeY * scaleY;
+      let widthPx = Math.max(18, safeWidth * scaleX);
+      let heightPx = Math.max(18, safeHeight * scaleY);
+      const text = dialog.translatedText || dialog.text;
+      const isVertical = cfg.horizontalText ? false : !!dialog.isVertical;
+      if (cfg.horizontalText) {
+        const estimatedWidth = clamp(text.length * (cfg.fontSize * 0.86), widthPx, imageRect.width * 0.55);
+        const estimatedHeight = clamp(Math.ceil(text.length / Math.max(4, Math.floor(estimatedWidth / (cfg.fontSize * 0.9)))) * cfg.fontSize * 1.45, heightPx, imageRect.height * 0.22);
+        leftPx -= (estimatedWidth - widthPx) / 2;
+        topPx -= (estimatedHeight - heightPx) / 2;
+        widthPx = estimatedWidth;
+        heightPx = estimatedHeight;
+      } else if (isVertical) {
+        const estimatedWidth = clamp(Math.ceil(text.length / 8) * cfg.fontSize * 1.3, widthPx, imageRect.width * 0.35);
+        leftPx -= (estimatedWidth - widthPx) / 2;
+        widthPx = estimatedWidth;
       }
-      const id = `ml-overlay-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
-      const transformedBounds = dialog.transformedBounds;
-      const bounds = transformedBounds || (dialog.bubbleBounds?.raw || dialog.boundingBox);
-      const imageWidth = imageElement.naturalWidth;
-      const imageHeight = imageElement.naturalHeight;
-      const boundsRight = bounds.x + bounds.width;
-      const boundsBottom = bounds.y + bounds.height;
-      let safeX = bounds.x;
-      let safeY = bounds.y;
-      let safeWidth = bounds.width;
-      let safeHeight = bounds.height;
-      if (boundsRight > imageWidth) {
-        safeWidth = Math.max(20, imageWidth - safeX);
-      }
-      if (boundsBottom > imageHeight) {
-        safeHeight = Math.max(20, imageHeight - safeY);
-      }
-      safeWidth = Math.max(20, safeWidth);
-      safeHeight = Math.max(20, safeHeight);
-      const safeBounds = {
-        x: safeX,
-        y: safeY,
-        width: safeWidth,
-        height: safeHeight
-      };
-      const displayedWidth = imageElement.clientWidth || imageElement.offsetWidth;
-      const displayedHeight = imageElement.clientHeight || imageElement.offsetHeight;
-      if (displayedWidth === 0 || displayedHeight === 0) {
-        console.error(`[Overlay#${id.slice(-6)}] \u274C \u56FE\u7247\u663E\u793A\u5C3A\u5BF8\u4E3A0\uFF0CnaturalWidth=${imageWidth}, naturalHeight=${imageHeight}, clientWidth=${displayedWidth}, offsetWidth=${imageElement.offsetWidth}`);
-      }
-      const imgRect = imageElement.getBoundingClientRect();
-      const containerRect = this.container.getBoundingClientRect();
-      const offsetX = imgRect.left - containerRect.left;
-      const offsetY = imgRect.top - containerRect.top;
-      const scaleX = displayedWidth / imageWidth;
-      const scaleY = displayedHeight / imageHeight;
-      const translatedText = dialog.translatedText || dialog.text;
-      const charCount = translatedText.length;
-      const charWidth = dialog.charWidth || 14;
-      let overlayWidth;
-      let overlayHeight;
-      if (isVertical) {
-        const estimatedCharWidth = charWidth * 1.2;
-        const estimatedCols = Math.max(1, Math.ceil(charCount / 8));
-        overlayWidth = estimatedCols * estimatedCharWidth;
-        overlayHeight = safeBounds.height;
-        console.log(`[Overlay#${id.slice(-6)}] \u7AD6\u6392\u5C3A\u5BF8\u8BA1\u7B97: ${charCount}\u5B57, charWidth=${charWidth.toFixed(1)}, cols=${estimatedCols}, \u5BBD\u5EA6=${overlayWidth.toFixed(1)}px`);
-      } else {
-        const lineHeight = charWidth * 1.4;
-        const estimatedLines = Math.ceil(charCount / 8);
-        overlayHeight = estimatedLines * lineHeight;
-        overlayWidth = safeBounds.width;
-        console.log(`[Overlay#${id.slice(-6)}] \u6A2A\u6392\u5C3A\u5BF8\u8BA1\u7B97: ${charCount}\u5B57, charWidth=${charWidth.toFixed(1)}, lines=${estimatedLines}, \u9AD8\u5EA6=${overlayHeight.toFixed(1)}px`);
-      }
-      overlayWidth = Math.max(20, Math.min(overlayWidth, displayedWidth * 0.8));
-      overlayHeight = Math.max(20, Math.min(overlayHeight, displayedHeight * 0.5));
-      const pixelLeft = safeBounds.x * scaleX;
-      const pixelTop = safeBounds.y * scaleY;
-      const pixelWidth = overlayWidth;
-      const pixelHeight = overlayHeight;
-      const containerWidth = containerRect.width;
-      const containerHeight = containerRect.height;
-      if (containerWidth === 0 || containerHeight === 0) {
-        console.error(`[Overlay#${id.slice(-6)}] \u274C \u5BB9\u5668\u5C3A\u5BF8\u4E3A0\uFF0CcontainerWidth=${containerWidth}, containerHeight=${containerHeight}`);
-      }
-      const safeContainerWidth = containerWidth || 1;
-      const safeContainerHeight = containerHeight || 1;
-      let left = (offsetX + pixelLeft) / safeContainerWidth * 100;
-      let top = (offsetY + pixelTop) / safeContainerHeight * 100;
-      let width = pixelWidth / safeContainerWidth * 100;
-      let height = pixelHeight / safeContainerHeight * 100;
-      left = Math.max(-10, Math.min(110, left));
-      top = Math.max(-10, Math.min(110, top));
-      width = Math.max(1, Math.min(100, width));
-      height = Math.max(1, Math.min(100, height));
-      if (left > 90 || top > 90 || left < -5 || top < -5) {
-        console.warn(`[Overlay#${id.slice(-6)}] \u26A0\uFE0F \u8986\u76D6\u5C42\u4F4D\u7F6E\u5F02\u5E38\u504F\u51FA: left=${left.toFixed(2)}%, top=${top.toFixed(2)}%`);
-      }
-      console.log(`[Overlay#${id.slice(-6)}] \u{1F4CD} \u6E32\u67D3\u4FE1\u606F [dialogId=${dialog.id}]:`);
-      console.log(`  \u539F\u6587: "${dialog.text}", \u8BD1\u6587: "${translatedText}"`);
-      console.log(`  \u65B9\u5411: ${isVertical ? "\u7AD6\u6392" : "\u6A2A\u6392"}, horizontalText=${cfg.horizontalText}`);
-      console.log(`  \u56FE\u7247\u5C3A\u5BF8: natural=${imageWidth}x${imageHeight}, displayed=${displayedWidth}x${displayedHeight}`);
-      console.log(`  \u7F29\u653E: scaleX=${scaleX.toFixed(4)}, scaleY=${scaleY.toFixed(4)}`);
-      console.log(`  \u6E32\u67D3\u8FB9\u754C: (${safeBounds.x}, ${safeBounds.y}) ${safeBounds.width}x${safeBounds.height}`);
-      console.log(`  \u52A8\u6001\u5C3A\u5BF8: ${overlayWidth.toFixed(1)}x${overlayHeight.toFixed(1)}px`);
-      console.log(`  \u767E\u5206\u6BD4\u4F4D\u7F6E: left=${left.toFixed(2)}%, top=${top.toFixed(2)}%, w=${width.toFixed(2)}%, h=${height.toFixed(2)}%`);
-      console.log(`  \u56FE\u7247\u504F\u79FB: (${offsetX.toFixed(1)}, ${offsetY.toFixed(1)})`);
-      console.log(`  \u5BB9\u5668\u5C3A\u5BF8: ${containerRect.width.toFixed(1)}x${containerRect.height.toFixed(1)}`);
-      console.log(`  \u5B57\u7B26: ${dialog.charCount}\u5B57, charWidth=${dialog.charWidth?.toFixed(1)}`);
-      if (!isVertical && overlayWidth < 50) {
-        console.warn(`[Overlay#${id.slice(-6)}] \u26A0\uFE0F \u6A2A\u6392\u8986\u76D6\u5C42\u5BBD\u5EA6\u4EC5 ${overlayWidth.toFixed(1)}px\uFF0C\u53EF\u80FD\u96BE\u4EE5\u770B\u5230\uFF01`);
-      }
-      if (!isVertical && bounds.width < 30) {
-        console.warn(`[Overlay#${id.slice(-6)}] \u26A0\uFE0F \u539F\u59CB\u6C14\u6CE1\u5BBD\u5EA6\u4EC5 ${bounds.width}px\uFF0C\u6A2A\u6392\u8986\u76D6\u5C42\u53EF\u80FD\u5F88\u7A84\uFF01`);
-      }
+      leftPx = clamp(leftPx, imageRect.left, Math.max(imageRect.left, imageRect.right - widthPx));
+      topPx = clamp(topPx, imageRect.top, Math.max(imageRect.top, imageRect.bottom - heightPx));
       const overlay = document.createElement("div");
       overlay.id = id;
       overlay.className = this.overlayClass;
-      overlay.textContent = translatedText;
-      const fontSize = this.calculateFontSizeForDialog(dialog, translatedText, safeBounds.width, cfg);
+      overlay.textContent = text;
+      const fontSize = this.calculateFontSizeForDialog(dialog, text, widthPx, cfg);
       const bgWithOpacity = this.hexToRgba(cfg.background, cfg.backgroundOpacity);
-      overlay.style.cssText = `
-      position: absolute;
-      left: ${left}%;
-      top: ${top}%;
-      width: ${width}%;
-      min-height: ${height}%;
-      font-family: "PingFang SC", "Microsoft YaHei", "Noto Sans SC", sans-serif;
-      font-size: ${fontSize}px;
-      line-height: 1.4;
-      color: ${cfg.color};
-      background: ${bgWithOpacity};
-      padding: ${cfg.padding}px;
-      margin: 0;
-      text-shadow: 0 0 2px rgba(255, 255, 255, 0.8);
-      box-shadow: 0 1px 3px rgba(0, 0, 0, 0.15);
-      border-radius: 3px;
-      word-break: break-all;
-      overflow-wrap: break-word;
-      white-space: pre-wrap;
-      text-align: center;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      transform: translateZ(0);
-      will-change: contents;
-      z-index: 1;
-      writing-mode: ${cfg.horizontalText ? "horizontal-tb" : "vertical-rl"};
-      ${cfg.horizontalText ? "max-height: " + height + "%;" : ""}
-    `;
+      overlay.style.cssText = [
+        "position:absolute",
+        `left:${leftPx}px`,
+        `top:${topPx}px`,
+        `width:${widthPx}px`,
+        `min-height:${heightPx}px`,
+        `font-family:"PingFang SC","Microsoft YaHei","Noto Sans SC",sans-serif`,
+        `font-size:${fontSize}px`,
+        "line-height:1.35",
+        `color:${cfg.color}`,
+        `background:${bgWithOpacity}`,
+        `padding:${cfg.padding}px`,
+        "margin:0",
+        "border-radius:3px",
+        "box-shadow:0 1px 3px rgba(0,0,0,0.12)",
+        "text-shadow:0 0 2px rgba(255,255,255,0.85)",
+        "word-break:break-word",
+        "overflow-wrap:anywhere",
+        "white-space:pre-wrap",
+        "text-align:center",
+        "display:flex",
+        "align-items:center",
+        "justify-content:center",
+        "box-sizing:border-box",
+        "pointer-events:none",
+        `writing-mode:${cfg.horizontalText ? "horizontal-tb" : "vertical-rl"}`
+      ].join(";");
       if (dialog.translationSuccess === false) {
-        overlay.style.border = "1px dashed #ff6666";
+        overlay.style.border = "1px dashed #ef4444";
         overlay.title = "\u7FFB\u8BD1\u5931\u8D25\uFF0C\u4F7F\u7528\u539F\u6587";
       }
-      this.container.appendChild(overlay);
+      container.appendChild(overlay);
       this.overlays.set(id, {
         id,
         originalBox: {
@@ -1124,128 +1194,51 @@ var MangaLensContent = (() => {
           confidence: 1,
           isVertical: dialog.isVertical || false
         },
-        translatedText,
-        element: overlay
+        translatedText: text,
+        element: overlay,
+        imageElement
       });
       return id;
     }
-    /**
-     * 批量渲染翻译后的对话
-     */
     renderMergedDialogs(imageElement, dialogs, config) {
-      this.imageBoundsMap.set(imageElement, {
-        width: imageElement.naturalWidth,
-        height: imageElement.naturalHeight
-      });
+      this.removeOverlaysForImage(imageElement);
       const ids = [];
-      let skippedCount = 0;
-      for (let i = 0; i < dialogs.length; i++) {
-        const dialog = dialogs[i];
+      for (const dialog of dialogs) {
         if (dialog.translatedText || dialog.text) {
-          const id = this.renderMergedDialog(imageElement, dialog, config);
-          ids.push(id);
-        } else {
-          skippedCount++;
-          console.warn(`[Overlay] \u8DF3\u8FC7\u6E32\u67D3: [${dialog.id}] \u65E0\u7FFB\u8BD1\u6587\u672C, \u539F\u6587: "${dialog.text.slice(0, 20)}"`);
+          ids.push(this.renderMergedDialog(imageElement, dialog, config));
         }
       }
-      console.log(`[Overlay] \u2705 \u6E32\u67D3\u5B8C\u6210: ${ids.length} \u4E2A\u8986\u76D6\u5C42, \u8DF3\u8FC7 ${skippedCount} \u4E2A (\u65E0\u7FFB\u8BD1\u6587\u672C)`);
-      if (ids.length > 0) {
-        console.log(`[Overlay] \u{1F4CD} \u6240\u6709\u8986\u76D6\u5C42\u5143\u7D20 ID:`, ids.map((id) => `#${id}`));
-      }
+      console.log(`[Overlay] \u6E32\u67D3\u5B8C\u6210: ${ids.length} \u4E2A\u8986\u76D6\u5C42`);
       return ids;
     }
-    /**
-     * 重新渲染所有覆盖层（已弃用旋转功能）
-     */
     rerenderOverlays(_imageElement) {
-      console.log("[Overlay] rerenderOverlays \u5DF2\u5F03\u7528\uFF0C\u65CB\u8F6C\u529F\u80FD\u5DF2\u79FB\u9664");
     }
-    /**
-     * 移除图片的所有覆盖层
-     */
-    removeOverlaysForImage(_imageElement) {
-      const container = document.getElementById(this.containerId);
-      if (container) {
-        container.remove();
-      }
-      this.container = null;
-      this.overlays.clear();
-    }
-    /**
-     * 计算字体大小
-     */
     calculateFontSize(boxWidth, config) {
-      const estimatedCharWidth = config.fontSize;
-      const charsPerLine = Math.floor(boxWidth / estimatedCharWidth);
-      if (charsPerLine <= 0) {
-        return config.fontSize;
-      }
-      return Math.min(config.fontSize, Math.max(10, boxWidth / charsPerLine * 0.8));
+      return clamp(Math.floor(boxWidth / 5), 10, config.fontSize);
     }
-    /**
-     * 基于对话信息计算字体大小
-     * 
-     * 算法：
-     * 1. 根据原文的平均字符宽度（charWidth）计算每个字符应占的像素
-     * 2. 考虑翻译后字符数与原文的差异
-     * 3. 使用 itemCharWidths 的加权平均作为基准
-     * 4. 确保字体大小在合理范围内
-     */
     calculateFontSizeForDialog(dialog, translatedText, boxWidth, config) {
-      if (!dialog.charWidth || dialog.charWidth <= 0) {
+      if (!dialog.charWidth || dialog.charWidth <= 0 || !dialog.charCount) {
         return this.calculateFontSize(boxWidth, config);
       }
-      const translatedCharCount = translatedText.length;
-      const ocrCharCount = dialog.charCount;
-      let weightedCharWidth = dialog.charWidth;
-      if (dialog.itemCharWidths && dialog.itemCharWidths.length > 0) {
-        const totalChars = dialog.itemCharWidths.reduce((sum, i) => sum + i.charCount, 0);
-        const weightedSum = dialog.itemCharWidths.reduce((sum, i) => sum + i.avgWidth * i.charCount, 0);
-        if (totalChars > 0) {
-          weightedCharWidth = weightedSum / totalChars;
-        }
-      }
-      const baseFontSize = weightedCharWidth * 0.8;
-      if (translatedCharCount > ocrCharCount && ocrCharCount > 0) {
-        const scaleFactor = Math.sqrt(ocrCharCount / translatedCharCount);
-        const adjustedFontSize = baseFontSize * scaleFactor;
-        const finalFontSize2 = Math.min(config.fontSize, Math.max(8, adjustedFontSize));
-        console.log(`[Overlay] \u5B57\u4F53\u8BA1\u7B97: charWidth=${weightedCharWidth.toFixed(1)}, \u539F\u6587${ocrCharCount}\u5B57\u2192\u8BD1\u6587${translatedCharCount}\u5B57, scale=${scaleFactor.toFixed(2)}, \u6700\u7EC8=${finalFontSize2.toFixed(1)}px`);
-        return finalFontSize2;
-      }
-      const finalFontSize = Math.min(config.fontSize, Math.max(10, baseFontSize));
-      console.log(`[Overlay] \u5B57\u4F53\u8BA1\u7B97: charWidth=${weightedCharWidth.toFixed(1)}, \u539F\u6587${ocrCharCount}\u5B57\u2192\u8BD1\u6587${translatedCharCount}\u5B57, \u6700\u7EC8=${finalFontSize.toFixed(1)}px`);
-      return finalFontSize;
+      const translatedCharCount = Math.max(1, translatedText.length);
+      const scaleFactor = Math.min(1, Math.sqrt(dialog.charCount / translatedCharCount));
+      return clamp(Math.round(dialog.charWidth * 0.95 * scaleFactor), 10, config.fontSize);
     }
-    /**
-     * 将 hex 颜色转换为 rgba
-     */
     hexToRgba(hex, alpha) {
-      if (hex.startsWith("rgba") || hex.startsWith("rgb")) {
-        return hex;
+      if (hex.startsWith("rgba") || hex.startsWith("rgb")) return hex;
+      const value = hex.replace("#", "");
+      if (!/^([0-9a-f]{3}|[0-9a-f]{6})$/i.test(value)) {
+        return `rgba(255,255,255,${alpha})`;
       }
-      hex = hex.replace("#", "");
-      let r, g, b;
-      if (hex.length === 3) {
-        r = parseInt(hex[0] + hex[0], 16);
-        g = parseInt(hex[1] + hex[1], 16);
-        b = parseInt(hex[2] + hex[2], 16);
-      } else if (hex.length === 6) {
-        r = parseInt(hex.substr(0, 2), 16);
-        g = parseInt(hex.substr(2, 2), 16);
-        b = parseInt(hex.substr(4, 2), 16);
-      } else {
-        return `rgba(255, 255, 255, ${alpha})`;
-      }
-      return `rgba(${r}, ${g}, ${b}, ${alpha})`;
+      const normalized = value.length === 3 ? value.split("").map((char) => char + char).join("") : value;
+      const r = Number.parseInt(normalized.slice(0, 2), 16);
+      const g = Number.parseInt(normalized.slice(2, 4), 16);
+      const b = Number.parseInt(normalized.slice(4, 6), 16);
+      return `rgba(${r},${g},${b},${alpha})`;
     }
-    /**
-     * 更新覆盖层样式
-     */
     updateStyle(style) {
       const styleElement = document.getElementById("manga-lens-styles") || this.createStyleElement();
-      const css = `
+      styleElement.textContent = `
       .manga-lens-text-overlay {
         ${style.background ? `background: ${style.background};` : ""}
         ${style.color ? `color: ${style.color};` : ""}
@@ -1253,54 +1246,227 @@ var MangaLensContent = (() => {
         ${style.opacity !== void 0 ? `opacity: ${style.opacity};` : ""}
       }
     `;
-      styleElement.textContent = css;
     }
-    /**
-     * 创建样式元素
-     */
     createStyleElement() {
       const style = document.createElement("style");
       style.id = "manga-lens-styles";
-      style.textContent = "";
       document.head.appendChild(style);
       return style;
     }
   };
   var overlayManager = new TranslationOverlayManager();
 
+  // src/modules/progress-reporter.ts
+  var PANEL_ID = "manga-lens-progress-panel";
+  var BODY_ID = "manga-lens-progress-body";
+  var TITLE_ID = "manga-lens-progress-title";
+  var SUBTITLE_ID = "manga-lens-progress-subtitle";
+  var BAR_ID = "manga-lens-progress-bar";
+  var LOG_ID = "manga-lens-progress-log";
+  var TOGGLE_ID = "manga-lens-progress-toggle";
+  var STAGE_LABEL = {
+    idle: "\u5F85\u547D",
+    scan: "\u626B\u63CF",
+    queued: "\u6392\u961F",
+    "image-ready": "\u56FE\u7247\u52A0\u8F7D",
+    "image-source": "\u56FE\u7247\u83B7\u53D6",
+    ocr: "OCR",
+    merge: "\u5408\u5E76",
+    translate: "\u7FFB\u8BD1",
+    render: "\u6E32\u67D3",
+    done: "\u5B8C\u6210",
+    skip: "\u8DF3\u8FC7",
+    error: "\u9519\u8BEF"
+  };
+  var STAGE_WEIGHT = {
+    idle: 0,
+    scan: 5,
+    queued: 10,
+    "image-ready": 18,
+    "image-source": 30,
+    ocr: 50,
+    merge: 64,
+    translate: 78,
+    render: 92,
+    done: 100,
+    skip: 100,
+    error: 100
+  };
+  function formatElapsed(ms) {
+    if (!ms) return "";
+    if (ms < 1e3) return `${ms}ms`;
+    return `${(ms / 1e3).toFixed(1)}s`;
+  }
+  function escapeText(value) {
+    return value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+  }
+  var ProgressReporter = class {
+    expanded = false;
+    lastUpdate = null;
+    logs = [];
+    update(update) {
+      this.lastUpdate = update;
+      this.ensurePanel();
+      const stage = STAGE_LABEL[update.stage] || update.stage;
+      const elapsed = formatElapsed(update.elapsedMs);
+      const parts = [stage];
+      if (update.imageIndex && update.imageTotal) parts.push(`\u56FE\u7247 ${update.imageIndex}/${update.imageTotal}`);
+      if (update.queueLength !== void 0) parts.push(`\u961F\u5217 ${update.queueLength}`);
+      if (elapsed) parts.push(`\u8017\u65F6 ${elapsed}`);
+      const detailParts = [];
+      if (update.source) detailParts.push(`\u6765\u6E90: ${update.source}`);
+      if (update.ocrBoxes !== void 0) detailParts.push(`OCR\u6846: ${update.ocrBoxes}`);
+      if (update.dialogs !== void 0) detailParts.push(`\u5BF9\u8BDD: ${update.dialogs}`);
+      if (update.totalToTranslate !== void 0) detailParts.push(`\u7FFB\u8BD1: ${update.translated || 0}/${update.totalToTranslate}`);
+      if (update.rendered !== void 0) detailParts.push(`\u6E32\u67D3: ${update.rendered}`);
+      const panel = document.getElementById(PANEL_ID);
+      const title = document.getElementById(TITLE_ID);
+      const subtitle = document.getElementById(SUBTITLE_ID);
+      const body = document.getElementById(BODY_ID);
+      const bar = document.getElementById(BAR_ID);
+      if (panel) {
+        panel.dataset.stage = update.stage;
+        panel.classList.toggle("is-expanded", this.expanded);
+      }
+      if (title) title.textContent = update.title;
+      if (subtitle) subtitle.textContent = [parts.join(" \xB7 "), update.detail, detailParts.join(" \xB7 ")].filter(Boolean).join("\n");
+      if (bar) bar.style.width = `${this.calculatePercent(update)}%`;
+      if (body) {
+        body.innerHTML = this.renderBody(update);
+      }
+      this.pushLog(update);
+      this.renderLog();
+    }
+    clear(delayMs = 1200) {
+      window.setTimeout(() => {
+        const panel = document.getElementById(PANEL_ID);
+        panel?.remove();
+        this.lastUpdate = null;
+        this.logs = [];
+      }, delayMs);
+    }
+    calculatePercent(update) {
+      if (update.stage === "translate" && update.totalToTranslate) {
+        const local = Math.min(1, Math.max(0, (update.translated || 0) / update.totalToTranslate));
+        return Math.round(68 + local * 20);
+      }
+      return STAGE_WEIGHT[update.stage] ?? 0;
+    }
+    ensurePanel() {
+      if (document.getElementById(PANEL_ID)) return;
+      const panel = document.createElement("div");
+      panel.id = PANEL_ID;
+      panel.innerHTML = `
+      <div class="manga-lens-progress-header">
+        <div>
+          <div id="${TITLE_ID}" class="manga-lens-progress-title">MangaLens</div>
+          <div id="${SUBTITLE_ID}" class="manga-lens-progress-subtitle"></div>
+        </div>
+        <button id="${TOGGLE_ID}" class="manga-lens-progress-toggle" type="button">\u8BE6\u60C5</button>
+      </div>
+      <div class="manga-lens-progress-track"><div id="${BAR_ID}" class="manga-lens-progress-bar"></div></div>
+      <div id="${BODY_ID}" class="manga-lens-progress-body"></div>
+      <div id="${LOG_ID}" class="manga-lens-progress-log"></div>
+    `;
+      document.body.appendChild(panel);
+      document.getElementById(TOGGLE_ID)?.addEventListener("click", () => {
+        this.expanded = !this.expanded;
+        panel.classList.toggle("is-expanded", this.expanded);
+        const toggle = document.getElementById(TOGGLE_ID);
+        if (toggle) toggle.textContent = this.expanded ? "\u6536\u8D77" : "\u8BE6\u60C5";
+        if (this.lastUpdate) {
+          this.update(this.lastUpdate);
+        }
+      });
+    }
+    renderBody(update) {
+      const rows = [
+        ["\u9636\u6BB5", STAGE_LABEL[update.stage]],
+        ["\u56FE\u7247", update.imageIndex && update.imageTotal ? `${update.imageIndex}/${update.imageTotal}` : void 0],
+        ["\u961F\u5217", update.queueLength],
+        ["\u6765\u6E90", update.source],
+        ["OCR \u6587\u672C\u6846", update.ocrBoxes],
+        ["\u5408\u5E76\u5BF9\u8BDD", update.dialogs],
+        ["\u7FFB\u8BD1\u8FDB\u5EA6", update.totalToTranslate !== void 0 ? `${update.translated || 0}/${update.totalToTranslate}` : void 0],
+        ["\u6E32\u67D3\u6570\u91CF", update.rendered],
+        ["\u8017\u65F6", formatElapsed(update.elapsedMs)],
+        ["\u8B66\u544A", update.warning],
+        ["\u9519\u8BEF", update.error]
+      ];
+      return rows.filter(([, value]) => value !== void 0 && value !== "").map(([key, value]) => `<div class="manga-lens-progress-row"><span>${escapeText(key)}</span><b>${escapeText(String(value))}</b></div>`).join("");
+    }
+    pushLog(update) {
+      const message = [
+        `[${STAGE_LABEL[update.stage]}]`,
+        update.title,
+        update.detail,
+        update.source ? `source=${update.source}` : "",
+        update.warning ? `warning=${update.warning}` : "",
+        update.error ? `error=${update.error}` : ""
+      ].filter(Boolean).join(" ");
+      this.logs.push(message);
+      this.logs = this.logs.slice(-8);
+      console.log(`[MangaLens][Progress] ${message}`);
+    }
+    renderLog() {
+      const log = document.getElementById(LOG_ID);
+      if (!log) return;
+      log.innerHTML = this.logs.map((line) => `<div>${escapeText(line)}</div>`).join("");
+    }
+  };
+  var progressReporter = new ProgressReporter();
+
   // src/content-script.ts
   var FAILED_IMAGE_COOLDOWN_MS = 15e3;
+  var IMAGE_PROCESS_DELAY_MS = 250;
+  var MAX_IMAGES_PER_SCAN = 6;
+  var PROCESS_QUEUE_CONCURRENCY = 1;
   var state = {
     isEnabled: true,
     isProcessing: false,
     processedImages: /* @__PURE__ */ new Set(),
+    processingImages: /* @__PURE__ */ new Set(),
     failedImages: /* @__PURE__ */ new Map(),
     zhipuApiKey: "",
     zhipuTranslationModel: "glm-4.7",
-    zhipuOcrModel: "glm-ocr"
+    zhipuOcrModel: "glm-ocr",
+    pageGeneration: 0
   };
-  function showLoading(message) {
-    const existing = document.getElementById("manga-lens-loading");
-    if (existing) existing.remove();
-    const loader = document.createElement("div");
-    loader.id = "manga-lens-loading";
-    loader.className = "manga-lens-loading";
-    loader.textContent = `MangaLens: ${message}`;
-    document.body.appendChild(loader);
-  }
-  function hideLoading() {
-    document.getElementById("manga-lens-loading")?.remove();
+  var scanTimer;
+  var activeWorkers = 0;
+  var totalEnqueuedInGeneration = 0;
+  var processQueue = [];
+  function sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
   }
   function asImageElement(element) {
     if (element instanceof HTMLImageElement) return element;
     const nested = element.querySelector("img");
     return nested instanceof HTMLImageElement ? nested : null;
   }
+  function getImageSrc2(image, imageElement) {
+    return image.src || imageElement.currentSrc || imageElement.src || imageElement.dataset.src || imageElement.dataset.lazySrc || "";
+  }
+  function shortImageName(src) {
+    try {
+      const url = new URL(src);
+      const name = url.pathname.split("/").pop() || url.hostname;
+      return `${url.hostname}/${name}`;
+    } catch {
+      return src.slice(0, 80);
+    }
+  }
+  function isProbablyVisible(imageElement) {
+    const rect = imageElement.getBoundingClientRect();
+    if (rect.width < 80 || rect.height < 80) return false;
+    const margin = Math.max(window.innerHeight * 1.5, 900);
+    return rect.bottom > -margin && rect.top < window.innerHeight + margin;
+  }
   function buildFallbackDetectedImage(img) {
     const rect = img.getBoundingClientRect();
     return {
       element: img,
-      src: img.src,
+      src: img.currentSrc || img.src || img.dataset.src || img.dataset.lazySrc || "",
       position: {
         x: rect.left + window.scrollX,
         y: rect.top + window.scrollY,
@@ -1321,22 +1487,142 @@ var MangaLensContent = (() => {
     } catch {
     }
   }
-  async function processImage(image) {
+  async function waitForImageReady(imageElement) {
+    if (imageElement.complete && imageElement.naturalWidth > 0 && imageElement.naturalHeight > 0) {
+      return true;
+    }
+    await Promise.race([
+      imageElement.decode?.().catch(() => void 0),
+      new Promise((resolve) => setTimeout(resolve, 2500))
+    ]);
+    return imageElement.naturalWidth > 0 && imageElement.naturalHeight > 0;
+  }
+  function createMergerForPage() {
+    const isPixiv = /(?:^|\.)pixiv\.net$/i.test(location.hostname);
+    return new DialogMerger({
+      yThreshold: isPixiv ? 42 : 50,
+      xThreshold: isPixiv ? 90 : 150,
+      rtlMode: true,
+      bubblePadding: isPixiv ? 3 : 8,
+      maxMergeDistance: isPixiv ? 220 : 300
+    });
+  }
+  async function processImage(image, generation = state.pageGeneration) {
     const imageElement = asImageElement(image.element);
     if (!imageElement) return;
-    const imageSrc = image.src || imageElement.src;
-    if (state.processedImages.has(imageSrc)) return;
-    const lastFailedAt = state.failedImages.get(imageSrc);
-    if (lastFailedAt && Date.now() - lastFailedAt < FAILED_IMAGE_COOLDOWN_MS) return;
+    const imageSrc = getImageSrc2(image, imageElement);
+    const imageIndex = Math.min(totalEnqueuedInGeneration, state.processedImages.size + state.processingImages.size + 1);
+    const startedAt = Date.now();
+    if (!isProbablyVisible(imageElement)) {
+      progressReporter.update({
+        stage: "skip",
+        title: "\u8DF3\u8FC7\u4E0D\u53EF\u89C1\u56FE\u7247",
+        detail: imageSrc ? shortImageName(imageSrc) : "\u56FE\u7247\u4E0D\u5728\u5F53\u524D\u9875\u9762\u9644\u8FD1",
+        imageIndex,
+        imageTotal: totalEnqueuedInGeneration,
+        queueLength: processQueue.length
+      });
+      return;
+    }
+    progressReporter.update({
+      stage: "image-ready",
+      title: "\u7B49\u5F85\u56FE\u7247\u52A0\u8F7D\u5B8C\u6210",
+      detail: imageSrc ? shortImageName(imageSrc) : "\u8BFB\u53D6\u9875\u9762\u56FE\u7247\u5143\u7D20",
+      imageIndex,
+      imageTotal: totalEnqueuedInGeneration,
+      queueLength: processQueue.length
+    });
+    if (!await waitForImageReady(imageElement)) {
+      progressReporter.update({
+        stage: "skip",
+        title: "\u56FE\u7247\u5C1A\u672A\u52A0\u8F7D\u5B8C\u6210\uFF0C\u5DF2\u8DF3\u8FC7",
+        detail: imageSrc ? shortImageName(imageSrc) : void 0,
+        imageIndex,
+        imageTotal: totalEnqueuedInGeneration,
+        queueLength: processQueue.length,
+        warning: "naturalWidth/naturalHeight \u4E3A\u7A7A"
+      });
+      return;
+    }
+    const resolvedSrc = getImageSrc2(image, imageElement);
+    if (!resolvedSrc) return;
+    if (state.processedImages.has(resolvedSrc) || state.processingImages.has(resolvedSrc)) return;
+    const lastFailedAt = state.failedImages.get(resolvedSrc);
+    if (lastFailedAt && Date.now() - lastFailedAt < FAILED_IMAGE_COOLDOWN_MS) {
+      progressReporter.update({
+        stage: "skip",
+        title: "\u56FE\u7247\u5904\u4E8E\u5931\u8D25\u51B7\u5374\u4E2D",
+        detail: shortImageName(resolvedSrc),
+        imageIndex,
+        imageTotal: totalEnqueuedInGeneration,
+        queueLength: processQueue.length,
+        warning: "15 \u79D2\u5185\u4E0D\u91CD\u590D\u8BF7\u6C42\u5931\u8D25\u56FE\u7247"
+      });
+      return;
+    }
     if (!state.zhipuApiKey) {
+      progressReporter.update({
+        stage: "error",
+        title: "\u7F3A\u5C11\u667A\u8C31 API Key",
+        detail: "\u8BF7\u5148\u5728\u6269\u5C55\u8BBE\u7F6E\u4E2D\u586B\u5199 API Key",
+        imageIndex,
+        imageTotal: totalEnqueuedInGeneration,
+        queueLength: processQueue.length
+      });
       console.error("[MangaLens] \u672A\u914D\u7F6E\u667A\u8C31 API Key\uFF0C\u8BF7\u5148\u5728\u6269\u5C55\u8BBE\u7F6E\u4E2D\u586B\u5199\u3002");
       return;
     }
+    state.processingImages.add(resolvedSrc);
     try {
-      showLoading("\u6B63\u5728\u8BC6\u522B\u6587\u5B57...");
+      progressReporter.update({
+        stage: "image-source",
+        title: "\u83B7\u53D6\u56FE\u7247\u6570\u636E\u5E76\u63D0\u4EA4 OCR",
+        detail: shortImageName(resolvedSrc),
+        imageIndex,
+        imageTotal: totalEnqueuedInGeneration,
+        queueLength: processQueue.length,
+        elapsedMs: Date.now() - startedAt
+      });
       const ocrResult = await mangaOCR.recognize(imageElement);
-      if (ocrResult.boxes.length === 0) return;
-      showLoading("\u6B63\u5728\u5408\u5E76\u5BF9\u8BDD...");
+      if (generation !== state.pageGeneration || !state.isEnabled) return;
+      progressReporter.update({
+        stage: "ocr",
+        title: "OCR \u8BC6\u522B\u5B8C\u6210",
+        detail: ocrResult.sourceMessage || shortImageName(resolvedSrc),
+        imageIndex,
+        imageTotal: totalEnqueuedInGeneration,
+        queueLength: processQueue.length,
+        source: ocrResult.source || "unknown",
+        ocrBoxes: ocrResult.boxes.length,
+        warning: ocrResult.warnings?.join("\uFF1B"),
+        elapsedMs: Date.now() - startedAt
+      });
+      if (ocrResult.boxes.length === 0) {
+        state.processedImages.add(resolvedSrc);
+        progressReporter.update({
+          stage: "done",
+          title: "OCR \u672A\u8BC6\u522B\u5230\u6587\u5B57",
+          detail: shortImageName(resolvedSrc),
+          imageIndex,
+          imageTotal: totalEnqueuedInGeneration,
+          queueLength: processQueue.length,
+          source: ocrResult.source || "unknown",
+          ocrBoxes: 0,
+          elapsedMs: Date.now() - startedAt
+        });
+        return;
+      }
+      progressReporter.update({
+        stage: "merge",
+        title: "\u6B63\u5728\u5408\u5E76 OCR \u6587\u672C\u6846",
+        detail: `${ocrResult.boxes.length} \u4E2A\u6587\u672C\u6846`,
+        imageIndex,
+        imageTotal: totalEnqueuedInGeneration,
+        queueLength: processQueue.length,
+        source: ocrResult.source || "unknown",
+        ocrBoxes: ocrResult.boxes.length,
+        elapsedMs: Date.now() - startedAt
+      });
       const ocrItems = ocrResult.boxes.map((box) => ({
         text: box.text,
         x: box.x,
@@ -1348,66 +1634,187 @@ var MangaLensContent = (() => {
         confidence: box.confidence || 1,
         isVertical: box.isVertical
       }));
-      const merger = new DialogMerger({ yThreshold: 50, xThreshold: 150, rtlMode: true });
+      const merger = createMergerForPage();
       let mergedDialogs = merger.merge(ocrItems);
       mergedDialogs = merger.calculateAllBubbleBounds(
         mergedDialogs,
         imageElement.naturalWidth || imageElement.width,
         imageElement.naturalHeight || imageElement.height
       );
-      showLoading(`\u6B63\u5728\u7FFB\u8BD1 ${mergedDialogs.length} \u6BB5\u5BF9\u8BDD...`);
+      progressReporter.update({
+        stage: "merge",
+        title: "\u6587\u672C\u6846\u5408\u5E76\u5B8C\u6210",
+        detail: `${ocrResult.boxes.length} \u4E2A\u6587\u672C\u6846 \u2192 ${mergedDialogs.length} \u6BB5\u5BF9\u8BDD`,
+        imageIndex,
+        imageTotal: totalEnqueuedInGeneration,
+        queueLength: processQueue.length,
+        source: ocrResult.source || "unknown",
+        ocrBoxes: ocrResult.boxes.length,
+        dialogs: mergedDialogs.length,
+        elapsedMs: Date.now() - startedAt
+      });
+      if (mergedDialogs.length === 0) {
+        state.processedImages.add(resolvedSrc);
+        return;
+      }
       const translator = new BatchTranslator({
         apiKey: state.zhipuApiKey,
-        model: state.zhipuTranslationModel
+        model: state.zhipuTranslationModel,
+        maxBatchSize: 40,
+        temperature: 0.35
+      });
+      progressReporter.update({
+        stage: "translate",
+        title: `\u6B63\u5728\u7FFB\u8BD1 ${mergedDialogs.length} \u6BB5\u5BF9\u8BDD`,
+        detail: mergedDialogs[0]?.text?.slice(0, 40),
+        imageIndex,
+        imageTotal: totalEnqueuedInGeneration,
+        queueLength: processQueue.length,
+        source: ocrResult.source || "unknown",
+        ocrBoxes: ocrResult.boxes.length,
+        dialogs: mergedDialogs.length,
+        translated: 0,
+        totalToTranslate: mergedDialogs.length,
+        elapsedMs: Date.now() - startedAt
       });
       const translationResult = await translator.translateInBatches(
         mergedDialogs.map((dialog, index) => ({
           id: index,
           text: dialog.text
         })),
-        (completed, total) => showLoading(`\u7FFB\u8BD1\u8FDB\u5EA6: ${completed}/${total}`)
+        (completed, total) => progressReporter.update({
+          stage: "translate",
+          title: `\u6B63\u5728\u7FFB\u8BD1 ${total} \u6BB5\u5BF9\u8BDD`,
+          detail: `\u5DF2\u5B8C\u6210 ${completed}/${total}`,
+          imageIndex,
+          imageTotal: totalEnqueuedInGeneration,
+          queueLength: processQueue.length,
+          source: ocrResult.source || "unknown",
+          ocrBoxes: ocrResult.boxes.length,
+          dialogs: mergedDialogs.length,
+          translated: completed,
+          totalToTranslate: total,
+          elapsedMs: Date.now() - startedAt
+        })
       );
+      if (generation !== state.pageGeneration || !state.isEnabled) return;
       for (const item of translationResult.items) {
         const dialog = mergedDialogs[item.id];
         if (!dialog) continue;
         dialog.translatedText = item.translatedText || item.originalText;
         dialog.translationSuccess = item.success;
       }
-      showLoading("\u6B63\u5728\u6E32\u67D3\u8BD1\u6587...");
-      overlayManager.renderMergedDialogs(imageElement, mergedDialogs, {
-        horizontalText: false,
+      progressReporter.update({
+        stage: "render",
+        title: "\u6B63\u5728\u6E32\u67D3\u8BD1\u6587\u8986\u76D6\u5C42",
+        detail: `\u7FFB\u8BD1\u6210\u529F ${translationResult.successCount} \u6BB5\uFF0C\u5931\u8D25 ${translationResult.failureCount} \u6BB5`,
+        imageIndex,
+        imageTotal: totalEnqueuedInGeneration,
+        queueLength: processQueue.length,
+        source: ocrResult.source || "unknown",
+        ocrBoxes: ocrResult.boxes.length,
+        dialogs: mergedDialogs.length,
+        translated: translationResult.successCount,
+        totalToTranslate: mergedDialogs.length,
+        elapsedMs: Date.now() - startedAt
+      });
+      const overlayIds = overlayManager.renderMergedDialogs(imageElement, mergedDialogs, {
+        horizontalText: true,
         fontSize: 14,
         background: "#FFFFFF",
-        backgroundOpacity: 0.88,
-        padding: 4
+        backgroundOpacity: 0.86,
+        padding: 3
       });
-      state.processedImages.add(imageSrc);
-      state.failedImages.delete(imageSrc);
+      state.processedImages.add(resolvedSrc);
+      state.failedImages.delete(resolvedSrc);
       await updatePopupStatus();
+      progressReporter.update({
+        stage: "done",
+        title: "\u5F53\u524D\u56FE\u7247\u7FFB\u8BD1\u5B8C\u6210",
+        detail: shortImageName(resolvedSrc),
+        imageIndex,
+        imageTotal: totalEnqueuedInGeneration,
+        queueLength: processQueue.length,
+        source: ocrResult.source || "unknown",
+        ocrBoxes: ocrResult.boxes.length,
+        dialogs: mergedDialogs.length,
+        translated: translationResult.successCount,
+        totalToTranslate: mergedDialogs.length,
+        rendered: overlayIds.length,
+        warning: ocrResult.source === "visible-tab-capture" ? "\u5F53\u524D\u4F7F\u7528\u622A\u56FE OCR\uFF0C\u6EDA\u52A8\u6216\u5207\u6362\u9605\u8BFB\u6A21\u5F0F\u65F6\u53EF\u80FD\u9519\u4F4D" : void 0,
+        elapsedMs: Date.now() - startedAt
+      });
     } catch (error) {
-      state.failedImages.set(imageSrc, Date.now());
+      state.failedImages.set(resolvedSrc, Date.now());
+      const message = error instanceof Error ? error.message : String(error);
+      progressReporter.update({
+        stage: "error",
+        title: "\u56FE\u7247\u5904\u7406\u5931\u8D25",
+        detail: shortImageName(resolvedSrc),
+        imageIndex,
+        imageTotal: totalEnqueuedInGeneration,
+        queueLength: processQueue.length,
+        error: message,
+        elapsedMs: Date.now() - startedAt
+      });
       console.error("[MangaLens] \u56FE\u7247\u5904\u7406\u5931\u8D25:", error);
     } finally {
-      hideLoading();
+      state.processingImages.delete(resolvedSrc);
     }
   }
-  async function processAllImages() {
-    if (state.isProcessing) return;
-    state.isProcessing = true;
-    showLoading("\u6B63\u5728\u626B\u63CF\u9875\u9762\u56FE\u7247...");
+  function enqueueImages(images) {
+    const existing = new Set(processQueue.map((item) => item.src));
+    const candidates = images.filter((image) => {
+      const img = asImageElement(image.element);
+      if (!img) return false;
+      const src = getImageSrc2(image, img);
+      return src && !existing.has(src) && !state.processedImages.has(src) && !state.processingImages.has(src);
+    }).sort((a, b) => a.position.y - b.position.y).slice(0, MAX_IMAGES_PER_SCAN);
+    if (candidates.length === 0) return;
+    processQueue.push(...candidates);
+    totalEnqueuedInGeneration = Math.max(totalEnqueuedInGeneration, state.processedImages.size + state.processingImages.size + processQueue.length);
+    progressReporter.update({
+      stage: "queued",
+      title: "\u5DF2\u52A0\u5165\u56FE\u7247\u7FFB\u8BD1\u961F\u5217",
+      detail: `\u65B0\u589E ${candidates.length} \u5F20\u5019\u9009\u56FE\u7247`,
+      imageTotal: totalEnqueuedInGeneration,
+      queueLength: processQueue.length
+    });
+    void drainQueue();
+  }
+  async function drainQueue() {
+    if (activeWorkers >= PROCESS_QUEUE_CONCURRENCY) return;
+    if (!state.isEnabled) return;
+    activeWorkers += 1;
+    const generation = state.pageGeneration;
     try {
-      const images = imageDetector.detectMangaImages();
-      for (const image of images) {
-        await processImage(image);
+      while (processQueue.length > 0 && state.isEnabled && generation === state.pageGeneration) {
+        const image = processQueue.shift();
+        if (!image) continue;
+        await processImage(image, generation);
+        await sleep(IMAGE_PROCESS_DELAY_MS);
       }
     } finally {
-      state.isProcessing = false;
-      hideLoading();
+      activeWorkers -= 1;
     }
+  }
+  function scheduleScan(delay = 400) {
+    window.clearTimeout(scanTimer);
+    scanTimer = window.setTimeout(() => {
+      if (!state.isEnabled) return;
+      progressReporter.update({
+        stage: "scan",
+        title: "\u6B63\u5728\u626B\u63CF\u9875\u9762\u56FE\u7247",
+        detail: location.hostname,
+        queueLength: processQueue.length
+      });
+      enqueueImages(imageDetector.detectMangaImages());
+    }, delay);
   }
   async function selectImageManually() {
     const image = await imageDetector.selectImage();
     if (image) {
+      totalEnqueuedInGeneration = Math.max(totalEnqueuedInGeneration, state.processedImages.size + 1);
       await processImage(image);
     }
   }
@@ -1432,25 +1839,57 @@ var MangaLensContent = (() => {
       await mangaOCR.initialize();
     }
   }
+  function resetPageState() {
+    state.pageGeneration += 1;
+    processQueue.length = 0;
+    totalEnqueuedInGeneration = 0;
+    state.processingImages.clear();
+    state.processedImages.clear();
+    state.failedImages.clear();
+    overlayManager.removeAllOverlays();
+    progressReporter.update({
+      stage: "scan",
+      title: "\u9875\u9762\u72B6\u6001\u5DF2\u91CD\u7F6E\uFF0C\u51C6\u5907\u91CD\u65B0\u626B\u63CF",
+      detail: location.href,
+      queueLength: 0
+    });
+  }
   async function initialize() {
     try {
       await loadConfig();
-      setTimeout(async () => {
+      setTimeout(() => {
         if (state.isEnabled) {
-          await processAllImages();
+          scheduleScan(0);
         }
-      }, 1e3);
-      const cleanup = imageDetector.observeNewImages(async (images) => {
+      }, 1200);
+      const cleanup = imageDetector.observeNewImages((images) => {
         if (!state.isEnabled) return;
-        for (const image of images) {
-          await processImage(image);
-        }
+        enqueueImages(images);
+      });
+      window.addEventListener("scroll", () => scheduleScan(350), { passive: true });
+      window.addEventListener("resize", () => {
+        if (!state.isEnabled) return;
+        overlayManager.removeAllOverlays();
+        state.processedImages.clear();
+        totalEnqueuedInGeneration = processQueue.length;
+        scheduleScan(350);
       });
       window.addEventListener("beforeunload", cleanup);
+      let lastUrl = location.href;
+      setInterval(() => {
+        if (location.href === lastUrl) return;
+        lastUrl = location.href;
+        resetPageState();
+        scheduleScan(900);
+      }, 1e3);
       console.log("[MangaLens] Content script initialized with Zhipu API");
     } catch (error) {
       console.error("[MangaLens] \u521D\u59CB\u5316\u5931\u8D25:", error);
-      hideLoading();
+      progressReporter.update({
+        stage: "error",
+        title: "MangaLens \u521D\u59CB\u5316\u5931\u8D25",
+        error: error instanceof Error ? error.message : String(error)
+      });
     }
   }
   window.addEventListener("manga-lens-rerender", async (event) => {
@@ -1459,7 +1898,7 @@ var MangaLensContent = (() => {
     if (!imageSrc) return;
     const images = document.querySelectorAll("img");
     for (const img of images) {
-      if (img.src === imageSrc) {
+      if (img.src === imageSrc || img.currentSrc === imageSrc) {
         state.processedImages.delete(imageSrc);
         state.failedImages.delete(imageSrc);
         await processImage(buildFallbackDetectedImage(img));
@@ -1472,11 +1911,9 @@ var MangaLensContent = (() => {
       case "TOGGLE_ENABLED":
         state.isEnabled = message.enabled;
         if (!state.isEnabled) {
-          overlayManager.removeAllOverlays();
-          state.processedImages.clear();
-          state.failedImages.clear();
+          resetPageState();
         } else {
-          processAllImages();
+          scheduleScan(0);
         }
         sendResponse({ success: true });
         break;
@@ -1494,10 +1931,8 @@ var MangaLensContent = (() => {
         })();
         return true;
       case "REFRESH":
-        state.processedImages.clear();
-        state.failedImages.clear();
-        overlayManager.removeAllOverlays();
-        processAllImages();
+        resetPageState();
+        scheduleScan(0);
         sendResponse({ success: true });
         break;
       case "SELECT_IMAGE":
@@ -1507,7 +1942,7 @@ var MangaLensContent = (() => {
       case "RERENDER_IMAGE":
         state.processedImages.delete(message.imageSrc);
         state.failedImages.delete(message.imageSrc);
-        processAllImages();
+        scheduleScan(0);
         sendResponse({ success: true });
         break;
       case "GET_STATUS":

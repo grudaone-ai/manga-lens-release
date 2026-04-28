@@ -4,11 +4,11 @@
   position: absolute !important;
   top: 0 !important;
   left: 0 !important;
-  width: 100% !important;
-  height: 100% !important;
+  width: 0 !important;
+  height: 0 !important;
   pointer-events: none !important;
-  z-index: 2147483647 !important;
-  overflow: hidden !important;
+  z-index: 2147483646 !important;
+  overflow: visible !important;
 }
 
 .manga-lens-text-overlay {
@@ -34,13 +34,11 @@
   transition: opacity 0.2s ease;
 }
 
-/* 竖排文字 */
 .manga-lens-text-overlay.vertical {
   writing-mode: vertical-rl;
   text-orientation: upright;
 }
 
-/* 动画效果 */
 @keyframes mangaLensFadeIn {
   from {
     opacity: 0;
@@ -56,7 +54,6 @@
   animation: mangaLensFadeIn 0.3s ease-out;
 }
 
-/* 悬停显示原文（可选功能） */
 .manga-lens-text-overlay:hover::after {
   content: attr(data-original);
   position: absolute;
@@ -73,7 +70,120 @@
   pointer-events: none;
 }
 
-/* 加载指示器 */
+#manga-lens-progress-panel {
+  position: fixed;
+  top: 16px;
+  right: 16px;
+  width: 330px;
+  max-width: calc(100vw - 32px);
+  background: rgba(17, 24, 39, 0.92);
+  color: #f9fafb;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 12px;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.32);
+  z-index: 2147483647;
+  font-family: "PingFang SC", "Microsoft YaHei", "Noto Sans SC", sans-serif;
+  font-size: 12px;
+  line-height: 1.45;
+  overflow: hidden;
+  backdrop-filter: blur(8px);
+}
+
+.manga-lens-progress-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 12px 9px;
+}
+
+.manga-lens-progress-title {
+  font-size: 14px;
+  font-weight: 700;
+  color: #ffffff;
+}
+
+.manga-lens-progress-subtitle {
+  margin-top: 3px;
+  color: #cbd5e1;
+  white-space: pre-line;
+  word-break: break-word;
+}
+
+.manga-lens-progress-toggle {
+  flex: 0 0 auto;
+  border: 0;
+  border-radius: 999px;
+  padding: 4px 9px;
+  background: rgba(59, 130, 246, 0.22);
+  color: #bfdbfe;
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.manga-lens-progress-track {
+  height: 4px;
+  background: rgba(255, 255, 255, 0.12);
+}
+
+.manga-lens-progress-bar {
+  height: 100%;
+  width: 0;
+  background: linear-gradient(90deg, #60a5fa, #34d399);
+  transition: width 0.25s ease;
+}
+
+.manga-lens-progress-body,
+.manga-lens-progress-log {
+  display: none;
+}
+
+#manga-lens-progress-panel.is-expanded .manga-lens-progress-body,
+#manga-lens-progress-panel.is-expanded .manga-lens-progress-log {
+  display: block;
+}
+
+.manga-lens-progress-body {
+  padding: 10px 12px;
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.manga-lens-progress-row {
+  display: grid;
+  grid-template-columns: 78px 1fr;
+  gap: 8px;
+  padding: 3px 0;
+}
+
+.manga-lens-progress-row span {
+  color: #94a3b8;
+}
+
+.manga-lens-progress-row b {
+  color: #e5e7eb;
+  font-weight: 600;
+  word-break: break-word;
+}
+
+.manga-lens-progress-log {
+  max-height: 140px;
+  overflow: auto;
+  padding: 8px 12px 12px;
+  color: #a7f3d0;
+  background: rgba(0, 0, 0, 0.18);
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+  font-family: Consolas, "SFMono-Regular", monospace;
+  font-size: 11px;
+}
+
+#manga-lens-progress-panel[data-stage="error"] .manga-lens-progress-bar {
+  background: #ef4444;
+}
+
+#manga-lens-progress-panel[data-stage="done"] .manga-lens-progress-bar {
+  background: #22c55e;
+}
+
 .manga-lens-loading {
   position: fixed;
   top: 20px;
