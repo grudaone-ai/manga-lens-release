@@ -3,6 +3,7 @@ import { mangaOCR } from './modules/ocr-engine';
 import { overlayManager } from './modules/translation-overlay';
 import { DialogMerger, type OCRTextItem } from './modules/dialog-merger';
 import { BatchTranslator } from './modules/batch-translator';
+import { progressReporter } from './modules/progress-reporter';
 
 interface MangaLensState {
   isEnabled: boolean;
@@ -35,25 +36,11 @@ const state: MangaLensState = {
 
 let scanTimer: number | undefined;
 let activeWorkers = 0;
+let totalEnqueuedInGeneration = 0;
 const processQueue: DetectedImage[] = [];
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-function showLoading(message: string): void {
-  const existing = document.getElementById('manga-lens-loading');
-  if (existing) existing.remove();
-
-  const loader = document.createElement('div');
-  loader.id = 'manga-lens-loading';
-  loader.className = 'manga-lens-loading';
-  loader.textContent = `MangaLens: ${message}`;
-  document.body.appendChild(loader);
-}
-
-function hideLoading(): void {
-  document.getElementById('manga-lens-loading')?.remove();
 }
 
 function asImageElement(element: HTMLElement): HTMLImageElement | null {
@@ -64,6 +51,16 @@ function asImageElement(element: HTMLElement): HTMLImageElement | null {
 
 function getImageSrc(image: DetectedImage, imageElement: HTMLImageElement): string {
   return image.src || imageElement.currentSrc || imageElement.src || imageElement.dataset.src || imageElement.dataset.lazySrc || '';
+}
+
+function shortImageName(src: string): string {
+  try {
+    const url = new URL(src);
+    const name = url.pathname.split('/').pop() || url.hostname;
+    return `${url.hostname}/${name}`;
+  } catch {
+    return src.slice(0, 80);
+  }
 }
 
 function isProbablyVisible(imageElement: HTMLImageElement): boolean {
@@ -130,33 +127,132 @@ async function processImage(image: DetectedImage, generation = state.pageGenerat
   const imageElement = asImageElement(image.element);
   if (!imageElement) return;
 
-  if (!isProbablyVisible(imageElement)) return;
-  if (!(await waitForImageReady(imageElement))) return;
-
   const imageSrc = getImageSrc(image, imageElement);
-  if (!imageSrc) return;
-  if (state.processedImages.has(imageSrc) || state.processingImages.has(imageSrc)) return;
+  const imageIndex = Math.min(totalEnqueuedInGeneration, state.processedImages.size + state.processingImages.size + 1);
+  const startedAt = Date.now();
 
-  const lastFailedAt = state.failedImages.get(imageSrc);
-  if (lastFailedAt && Date.now() - lastFailedAt < FAILED_IMAGE_COOLDOWN_MS) return;
+  if (!isProbablyVisible(imageElement)) {
+    progressReporter.update({
+      stage: 'skip',
+      title: '跳过不可见图片',
+      detail: imageSrc ? shortImageName(imageSrc) : '图片不在当前页面附近',
+      imageIndex,
+      imageTotal: totalEnqueuedInGeneration,
+      queueLength: processQueue.length
+    });
+    return;
+  }
+
+  progressReporter.update({
+    stage: 'image-ready',
+    title: '等待图片加载完成',
+    detail: imageSrc ? shortImageName(imageSrc) : '读取页面图片元素',
+    imageIndex,
+    imageTotal: totalEnqueuedInGeneration,
+    queueLength: processQueue.length
+  });
+
+  if (!(await waitForImageReady(imageElement))) {
+    progressReporter.update({
+      stage: 'skip',
+      title: '图片尚未加载完成，已跳过',
+      detail: imageSrc ? shortImageName(imageSrc) : undefined,
+      imageIndex,
+      imageTotal: totalEnqueuedInGeneration,
+      queueLength: processQueue.length,
+      warning: 'naturalWidth/naturalHeight 为空'
+    });
+    return;
+  }
+
+  const resolvedSrc = getImageSrc(image, imageElement);
+  if (!resolvedSrc) return;
+  if (state.processedImages.has(resolvedSrc) || state.processingImages.has(resolvedSrc)) return;
+
+  const lastFailedAt = state.failedImages.get(resolvedSrc);
+  if (lastFailedAt && Date.now() - lastFailedAt < FAILED_IMAGE_COOLDOWN_MS) {
+    progressReporter.update({
+      stage: 'skip',
+      title: '图片处于失败冷却中',
+      detail: shortImageName(resolvedSrc),
+      imageIndex,
+      imageTotal: totalEnqueuedInGeneration,
+      queueLength: processQueue.length,
+      warning: '15 秒内不重复请求失败图片'
+    });
+    return;
+  }
 
   if (!state.zhipuApiKey) {
+    progressReporter.update({
+      stage: 'error',
+      title: '缺少智谱 API Key',
+      detail: '请先在扩展设置中填写 API Key',
+      imageIndex,
+      imageTotal: totalEnqueuedInGeneration,
+      queueLength: processQueue.length
+    });
     console.error('[MangaLens] 未配置智谱 API Key，请先在扩展设置中填写。');
     return;
   }
 
-  state.processingImages.add(imageSrc);
+  state.processingImages.add(resolvedSrc);
 
   try {
-    showLoading('正在识别文字...');
+    progressReporter.update({
+      stage: 'image-source',
+      title: '获取图片数据并提交 OCR',
+      detail: shortImageName(resolvedSrc),
+      imageIndex,
+      imageTotal: totalEnqueuedInGeneration,
+      queueLength: processQueue.length,
+      elapsedMs: Date.now() - startedAt
+    });
+
     const ocrResult = await mangaOCR.recognize(imageElement);
     if (generation !== state.pageGeneration || !state.isEnabled) return;
+
+    progressReporter.update({
+      stage: 'ocr',
+      title: 'OCR 识别完成',
+      detail: ocrResult.sourceMessage || shortImageName(resolvedSrc),
+      imageIndex,
+      imageTotal: totalEnqueuedInGeneration,
+      queueLength: processQueue.length,
+      source: ocrResult.source || 'unknown',
+      ocrBoxes: ocrResult.boxes.length,
+      warning: ocrResult.warnings?.join('；'),
+      elapsedMs: Date.now() - startedAt
+    });
+
     if (ocrResult.boxes.length === 0) {
-      state.processedImages.add(imageSrc);
+      state.processedImages.add(resolvedSrc);
+      progressReporter.update({
+        stage: 'done',
+        title: 'OCR 未识别到文字',
+        detail: shortImageName(resolvedSrc),
+        imageIndex,
+        imageTotal: totalEnqueuedInGeneration,
+        queueLength: processQueue.length,
+        source: ocrResult.source || 'unknown',
+        ocrBoxes: 0,
+        elapsedMs: Date.now() - startedAt
+      });
       return;
     }
 
-    showLoading('正在合并对话...');
+    progressReporter.update({
+      stage: 'merge',
+      title: '正在合并 OCR 文本框',
+      detail: `${ocrResult.boxes.length} 个文本框`,
+      imageIndex,
+      imageTotal: totalEnqueuedInGeneration,
+      queueLength: processQueue.length,
+      source: ocrResult.source || 'unknown',
+      ocrBoxes: ocrResult.boxes.length,
+      elapsedMs: Date.now() - startedAt
+    });
+
     const ocrItems: OCRTextItem[] = ocrResult.boxes.map((box) => ({
       text: box.text,
       x: box.x,
@@ -177,12 +273,24 @@ async function processImage(image: DetectedImage, generation = state.pageGenerat
       imageElement.naturalHeight || imageElement.height
     );
 
+    progressReporter.update({
+      stage: 'merge',
+      title: '文本框合并完成',
+      detail: `${ocrResult.boxes.length} 个文本框 → ${mergedDialogs.length} 段对话`,
+      imageIndex,
+      imageTotal: totalEnqueuedInGeneration,
+      queueLength: processQueue.length,
+      source: ocrResult.source || 'unknown',
+      ocrBoxes: ocrResult.boxes.length,
+      dialogs: mergedDialogs.length,
+      elapsedMs: Date.now() - startedAt
+    });
+
     if (mergedDialogs.length === 0) {
-      state.processedImages.add(imageSrc);
+      state.processedImages.add(resolvedSrc);
       return;
     }
 
-    showLoading(`正在翻译 ${mergedDialogs.length} 段对话...`);
     const translator = new BatchTranslator({
       apiKey: state.zhipuApiKey,
       model: state.zhipuTranslationModel,
@@ -190,12 +298,40 @@ async function processImage(image: DetectedImage, generation = state.pageGenerat
       temperature: 0.35
     });
 
+    progressReporter.update({
+      stage: 'translate',
+      title: `正在翻译 ${mergedDialogs.length} 段对话`,
+      detail: mergedDialogs[0]?.text?.slice(0, 40),
+      imageIndex,
+      imageTotal: totalEnqueuedInGeneration,
+      queueLength: processQueue.length,
+      source: ocrResult.source || 'unknown',
+      ocrBoxes: ocrResult.boxes.length,
+      dialogs: mergedDialogs.length,
+      translated: 0,
+      totalToTranslate: mergedDialogs.length,
+      elapsedMs: Date.now() - startedAt
+    });
+
     const translationResult = await translator.translateInBatches(
       mergedDialogs.map((dialog, index) => ({
         id: index,
         text: dialog.text
       })),
-      (completed, total) => showLoading(`翻译进度: ${completed}/${total}`)
+      (completed, total) => progressReporter.update({
+        stage: 'translate',
+        title: `正在翻译 ${total} 段对话`,
+        detail: `已完成 ${completed}/${total}`,
+        imageIndex,
+        imageTotal: totalEnqueuedInGeneration,
+        queueLength: processQueue.length,
+        source: ocrResult.source || 'unknown',
+        ocrBoxes: ocrResult.boxes.length,
+        dialogs: mergedDialogs.length,
+        translated: completed,
+        totalToTranslate: total,
+        elapsedMs: Date.now() - startedAt
+      })
     );
 
     if (generation !== state.pageGeneration || !state.isEnabled) return;
@@ -208,8 +344,22 @@ async function processImage(image: DetectedImage, generation = state.pageGenerat
       dialog.translationSuccess = item.success;
     }
 
-    showLoading('正在渲染译文...');
-    overlayManager.renderMergedDialogs(imageElement, mergedDialogs, {
+    progressReporter.update({
+      stage: 'render',
+      title: '正在渲染译文覆盖层',
+      detail: `翻译成功 ${translationResult.successCount} 段，失败 ${translationResult.failureCount} 段`,
+      imageIndex,
+      imageTotal: totalEnqueuedInGeneration,
+      queueLength: processQueue.length,
+      source: ocrResult.source || 'unknown',
+      ocrBoxes: ocrResult.boxes.length,
+      dialogs: mergedDialogs.length,
+      translated: translationResult.successCount,
+      totalToTranslate: mergedDialogs.length,
+      elapsedMs: Date.now() - startedAt
+    });
+
+    const overlayIds = overlayManager.renderMergedDialogs(imageElement, mergedDialogs, {
       horizontalText: true,
       fontSize: 14,
       background: '#FFFFFF',
@@ -217,15 +367,42 @@ async function processImage(image: DetectedImage, generation = state.pageGenerat
       padding: 3
     });
 
-    state.processedImages.add(imageSrc);
-    state.failedImages.delete(imageSrc);
+    state.processedImages.add(resolvedSrc);
+    state.failedImages.delete(resolvedSrc);
     await updatePopupStatus();
+
+    progressReporter.update({
+      stage: 'done',
+      title: '当前图片翻译完成',
+      detail: shortImageName(resolvedSrc),
+      imageIndex,
+      imageTotal: totalEnqueuedInGeneration,
+      queueLength: processQueue.length,
+      source: ocrResult.source || 'unknown',
+      ocrBoxes: ocrResult.boxes.length,
+      dialogs: mergedDialogs.length,
+      translated: translationResult.successCount,
+      totalToTranslate: mergedDialogs.length,
+      rendered: overlayIds.length,
+      warning: ocrResult.source === 'visible-tab-capture' ? '当前使用截图 OCR，滚动或切换阅读模式时可能错位' : undefined,
+      elapsedMs: Date.now() - startedAt
+    });
   } catch (error) {
-    state.failedImages.set(imageSrc, Date.now());
+    state.failedImages.set(resolvedSrc, Date.now());
+    const message = error instanceof Error ? error.message : String(error);
+    progressReporter.update({
+      stage: 'error',
+      title: '图片处理失败',
+      detail: shortImageName(resolvedSrc),
+      imageIndex,
+      imageTotal: totalEnqueuedInGeneration,
+      queueLength: processQueue.length,
+      error: message,
+      elapsedMs: Date.now() - startedAt
+    });
     console.error('[MangaLens] 图片处理失败:', error);
   } finally {
-    state.processingImages.delete(imageSrc);
-    hideLoading();
+    state.processingImages.delete(resolvedSrc);
   }
 }
 
@@ -241,7 +418,19 @@ function enqueueImages(images: DetectedImage[]): void {
     .sort((a, b) => a.position.y - b.position.y)
     .slice(0, MAX_IMAGES_PER_SCAN);
 
+  if (candidates.length === 0) return;
+
   processQueue.push(...candidates);
+  totalEnqueuedInGeneration = Math.max(totalEnqueuedInGeneration, state.processedImages.size + state.processingImages.size + processQueue.length);
+
+  progressReporter.update({
+    stage: 'queued',
+    title: '已加入图片翻译队列',
+    detail: `新增 ${candidates.length} 张候选图片`,
+    imageTotal: totalEnqueuedInGeneration,
+    queueLength: processQueue.length
+  });
+
   void drainQueue();
 }
 
@@ -268,6 +457,12 @@ function scheduleScan(delay = 400): void {
   window.clearTimeout(scanTimer);
   scanTimer = window.setTimeout(() => {
     if (!state.isEnabled) return;
+    progressReporter.update({
+      stage: 'scan',
+      title: '正在扫描页面图片',
+      detail: location.hostname,
+      queueLength: processQueue.length
+    });
     enqueueImages(imageDetector.detectMangaImages());
   }, delay);
 }
@@ -276,19 +471,24 @@ async function processAllImages(): Promise<void> {
   if (state.isProcessing) return;
 
   state.isProcessing = true;
-  showLoading('正在扫描页面图片...');
+  progressReporter.update({
+    stage: 'scan',
+    title: '正在扫描页面图片',
+    detail: location.href,
+    queueLength: processQueue.length
+  });
 
   try {
     enqueueImages(imageDetector.detectMangaImages());
   } finally {
     state.isProcessing = false;
-    hideLoading();
   }
 }
 
 async function selectImageManually(): Promise<void> {
   const image = await imageDetector.selectImage();
   if (image) {
+    totalEnqueuedInGeneration = Math.max(totalEnqueuedInGeneration, state.processedImages.size + 1);
     await processImage(image);
   }
 }
@@ -320,10 +520,17 @@ async function loadConfig(): Promise<void> {
 function resetPageState(): void {
   state.pageGeneration += 1;
   processQueue.length = 0;
+  totalEnqueuedInGeneration = 0;
   state.processingImages.clear();
   state.processedImages.clear();
   state.failedImages.clear();
   overlayManager.removeAllOverlays();
+  progressReporter.update({
+    stage: 'scan',
+    title: '页面状态已重置，准备重新扫描',
+    detail: location.href,
+    queueLength: 0
+  });
 }
 
 async function initialize(): Promise<void> {
@@ -346,11 +553,11 @@ async function initialize(): Promise<void> {
       if (!state.isEnabled) return;
       overlayManager.removeAllOverlays();
       state.processedImages.clear();
+      totalEnqueuedInGeneration = processQueue.length;
       scheduleScan(350);
     });
     window.addEventListener('beforeunload', cleanup);
 
-    // Pixiv 是 SPA，作品页切换 #p 或路由时不会完整刷新，需要主动重扫。
     let lastUrl = location.href;
     setInterval(() => {
       if (location.href === lastUrl) return;
@@ -362,7 +569,11 @@ async function initialize(): Promise<void> {
     console.log('[MangaLens] Content script initialized with Zhipu API');
   } catch (error) {
     console.error('[MangaLens] 初始化失败:', error);
-    hideLoading();
+    progressReporter.update({
+      stage: 'error',
+      title: 'MangaLens 初始化失败',
+      error: error instanceof Error ? error.message : String(error)
+    });
   }
 }
 
