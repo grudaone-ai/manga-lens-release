@@ -1,41 +1,41 @@
-# Dependencies
-node_modules/
+# # Dependencies
+# node_modules/
 
-# Build output
-dist/
-*.crx
-*.xpi
-*.zip
+# # Build output
+# dist/
+# *.crx
+# *.xpi
+# *.zip
 
-# IDE
-.idea/
-.vscode/
-*.swp
-*.swo
+# # IDE
+# .idea/
+# .vscode/
+# *.swp
+# *.swo
 
-# OS
-.DS_Store
-Thumbs.db
+# # OS
+# .DS_Store
+# Thumbs.db
 
-# Environment
-.env
-.env.local
-.env.*.local
+# # Environment
+# .env
+# .env.local
+# .env.*.local
 
-# Logs
-*.log
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
+# # Logs
+# *.log
+# npm-debug.log*
+# yarn-debug.log*
+# yarn-error.log*
 
-# Test
-coverage/
+# # Test
+# coverage/
 
-# Temporary
-*.tmp
-.cache/
+# # Temporary
+# *.tmp
+# .cache/
 
-# Python
+# # Python
 # __pycache__/
 # *.pyc
 # *.pyo
