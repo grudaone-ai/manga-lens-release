@@ -23,9 +23,7 @@ from tencentcloud.ocr.v20181119 import ocr_client, models
 ANCHOR_TEXT = "<この画像は横方向です>"
 
 # 腾讯云凭证
-SECRET_ID = "AKIDcMZYIo4B6pKbfUI4e2EyTiicS8bswnPn"
-SECRET_KEY = "EDyVFn7F8nIZdU6JLyMXUEl48wVu513v"
-REGION = "ap-guangzhou"  # 广州地域
+
 
 class TencentOCRServicer:
     """腾讯云 OCR 服务封装"""
