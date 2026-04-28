@@ -14,7 +14,7 @@ function buildFetchOptions(imageUrl: string, pageUrl?: string): RequestInit {
   const options: RequestInit = {
     mode: 'cors',
     credentials: 'omit',
-    cache: 'default'
+    cache: 'force-cache'
   };
 
   if (!pageUrl) return options;
@@ -41,8 +41,18 @@ function buildFetchOptions(imageUrl: string, pageUrl?: string): RequestInit {
   }
 }
 
+async function fetchWithTimeout(url: string, options: RequestInit, timeoutMs = 15000): Promise<Response> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function fetchImageAsBase64(imageUrl: string, pageUrl?: string): Promise<string> {
-  const response = await fetch(imageUrl, buildFetchOptions(imageUrl, pageUrl));
+  const response = await fetchWithTimeout(imageUrl, buildFetchOptions(imageUrl, pageUrl));
   if (!response.ok) {
     throw new Error(`图片获取失败: HTTP ${response.status}`);
   }
@@ -58,11 +68,37 @@ async function fetchImageAsBase64(imageUrl: string, pageUrl?: string): Promise<s
   return `data:${contentType};base64,${btoa(binary)}`;
 }
 
-function captureVisibleTab(): Promise<string> {
+function queryActiveTab(): Promise<chrome.tabs.Tab | null> {
+  return new Promise((resolve) => {
+    chrome.tabs.query({ active: true, currentWindow: true }, ([tab]) => resolve(tab || null));
+  });
+}
+
+function isCropVisible(cropRect: CropRect): boolean {
+  return (
+    cropRect.width > 0 &&
+    cropRect.height > 0 &&
+    cropRect.left < screen.width &&
+    cropRect.top < screen.height &&
+    cropRect.left + cropRect.width > 0 &&
+    cropRect.top + cropRect.height > 0
+  );
+}
+
+async function captureVisibleTab(expectedTabId?: number, cropRect?: CropRect): Promise<string> {
+  const activeTab = await queryActiveTab();
+  if (expectedTabId && activeTab?.id !== expectedTabId) {
+    throw new Error('当前标签页已切换，已取消截图 OCR，避免识别到错误标签页');
+  }
+
+  if (cropRect && !isCropVisible(cropRect)) {
+    throw new Error('图片不在当前可见区域，已跳过截图 OCR');
+  }
+
   return new Promise((resolve, reject) => {
     captureQueue = captureQueue
       .then(async () => {
-        const waitMs = Math.max(0, 700 - (Date.now() - lastCaptureAt));
+        const waitMs = Math.max(0, 900 - (Date.now() - lastCaptureAt));
         if (waitMs > 0) {
           await new Promise((done) => setTimeout(done, waitMs));
         }
@@ -126,9 +162,10 @@ async function captureAndRecognizeVisibleImage(
   cropRect: CropRect,
   devicePixelRatio: number,
   apiKey: string,
-  model: string
+  model: string,
+  tabId?: number
 ) {
-  const screenshot = await captureVisibleTab();
+  const screenshot = await captureVisibleTab(tabId, cropRect);
   const croppedImage = await cropCapturedImage(screenshot, cropRect, devicePixelRatio);
   return recognizeWithZhipuOCR(croppedImage, apiKey, model);
 }
@@ -143,7 +180,7 @@ chrome.runtime.onInstalled.addListener(() => {
   });
 });
 
-chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.target !== 'background') {
     return true;
   }
@@ -178,16 +215,14 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     case 'TEST_ZHIPU_OCR':
       (async () => {
         try {
-          const testImageBase64 = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAoAAAAKCAYAAACNMs+9AAAAFUlEQVR42mP8z8BQDwADhQGAWjR9awAAAABJRU5ErkJggg==';
-          const result = await recognizeWithZhipuOCR(
-            testImageBase64,
-            message.apiKey,
-            message.model || 'glm-ocr'
-          );
+          // 原测试图是 10x10 纯色图，OCR 正确返回空结果时也容易被误判为错误。
+          // 这里换成真实含字母数字的 PNG，能同时验证 Key、模型名、接口格式。
+          const testImageBase64 = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAPAAAABQCAIAAACoK28rAAAEdklEQVR4nO3dPUh6XxzH8dsDhRIIgmUJtQQG0QPdIexBr1l3aS1bKiNoiZqiWoKWQCRoKBoqUNsighwqTCMosqKhwaWhNqPggj1QWFp5/sOFi/Sz/v3+/uD/88vnNZ17POd4L7x7wIZyGGMcABW5//cNAPxJCBpIQdBACoIGUhA0kIKggRQEDaQgaCAFQQMpCBpIQdBACoIGUhA0kIKggRQEDaQgaCAFQQMpCBpIQdBACoIGUhA0kIKggRQEDaQgaCAFQQMpCBpIyTRoj8fD87zJZOJ5fnV1VZ5cWVlpaGiwWCydnZ2RSESeVKvVgiBYLJaGhoaDgwN5cnNzUxAEQRDy8/PlwcbGhrxSNjc3x3Hc+fm5KIpWq7WjoyMSiaTdJR/48PAwMDCg0WiUO3S73a2trfX19YFAgOO4WCzW09MjCALP89vb2xk+Pvx1WAb8fn9zc/P9/T1j7P7+vrm5ORgMBgIBq9Uai8UYYzs7O21tbfJijUYjD8LhcE1NzaejlFc/jWV1dXWRSIQxtrGxYbfbv1nZ0tIyPz+vzEuSZDabPz4+Li4uqqqqGGMul2t2dpYxdnNzU1FR8Z+eG/5eGQVts9mOj4+Vy1Ao1N7eLoriycmJMjk0NJRIJFhKfMlkUqvVfjrq+6BLS0svLy8ZY4lE4vDw8JuVt7e3qfMXFxfr6+uMsefnZ51Oxxi7u7uLx+OMsWAwWFlZ+TuPC1kgo6DLyspeXl6Uy5eXl7KyMoPB8Pr6+utiJTK/39/V1fXVqyxdph6PR6/XDw4O7u/vf7Xr+3mv1zs4OKhc9vb2qtXqvb29tNshe/3JoGOxmMFg0Ov1aYNWqVQWi6WpqUmr1crfR1OlJiivlCk/Ae7u7txud21t7fT0dNpdX53GGLu6uqqurpYkKXXS5/P19fX96zNCdsko6Pb29lAopFweHR2Jomg2m09PT+WZZDLZ398vj5XIXC6X0+n8dNQ336ElSVLeRZKkkpKSr1amnX96euJ5XrmlkZGRt7c3xtj7+/uvv/lAtsvoU47x8fGJiYnHx0eO4x4eHiYnJycmJoaHh6empuLxOMdxa2tr8iBVR0fH2dnZz98lJyfHbrfLn5ZEo9Hy8vKf72WMORyOsbGxxsZGeebx8dHn83Ecd3x8bDQaf34UZIX8TDaLonh9fW21WgsLCxOJxOjoqM1m4zju8vKS53mdTldcXLy4uPhpl9FoDIfDyWQyNzf9l1MikRAEQR6bTCan07m8vNzd3a1SqfLy8txu98/v0Ov17u7uRqPRpaWloqKira2tmZkZh8OxsLBQUFDwW0dBVshh+JcUQAj+UgikIGggBUEDKQgaSEHQQAqCBlIQNJCCoIEUBA2kIGggBUEDKQgaSEHQQAqCBlIQNJCCoIEUBA2kIGggBUEDKQgaSEHQQAqCBlIQNJCCoIEUBA2kIGggBUEDKQgaSEHQQAqCBlIQNJCCoIEUBA2kIGggBUEDKQgaSEHQQAqCBlIQNJCCoIEUBA2kIGggBUEDKQgaSPkHsXrIuAOLC/QAAAAASUVORK5CYII=';
+          const result = await recognizeWithZhipuOCR(testImageBase64, message.apiKey, message.model || 'glm-ocr');
 
           sendResponse({
             success: true,
-            message: `智谱 OCR 连接成功，识别到 ${result.items.length} 个文本区域`,
+            message: `智谱 OCR 连接成功，识别到 ${result.items.length} 个文本区域${result.text ? `：${result.text.slice(0, 30)}` : ''}`,
             requestId: result.requestId
           });
         } catch (error) {
@@ -208,7 +243,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
             imageBase64 = await fetchImageAsBase64(message.imageUrl, message.pageUrl);
           } catch (error) {
             const messageText = error instanceof Error ? error.message : String(error);
-            const isForbidden = messageText.includes('HTTP 403');
+            const isForbidden = messageText.includes('HTTP 403') || messageText.includes('Failed to fetch');
             if (!isForbidden || !message.cropRect) {
               throw error;
             }
@@ -217,7 +252,8 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
               message.cropRect,
               message.devicePixelRatio || 1,
               message.apiKey,
-              message.model || 'glm-ocr'
+              message.model || 'glm-ocr',
+              sender.tab?.id
             );
 
             sendResponse({
@@ -225,16 +261,14 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
               text: fallbackResult.text,
               items: fallbackResult.items,
               requestId: fallbackResult.requestId,
+              sourceWidth: Math.round(message.cropRect.width * (message.devicePixelRatio || 1)),
+              sourceHeight: Math.round(message.cropRect.height * (message.devicePixelRatio || 1)),
               fallback: 'visible-tab-capture'
             });
             return;
           }
 
-          const result = await recognizeWithZhipuOCR(
-            imageBase64,
-            message.apiKey,
-            message.model || 'glm-ocr'
-          );
+          const result = await recognizeWithZhipuOCR(imageBase64, message.apiKey, message.model || 'glm-ocr');
 
           sendResponse({
             success: true,
