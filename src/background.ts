@@ -7,6 +7,11 @@ interface CropRect {
   height: number;
 }
 
+interface ViewportInfo {
+  width?: number;
+  height?: number;
+}
+
 let lastCaptureAt = 0;
 let captureQueue: Promise<void> = Promise.resolve();
 
@@ -74,24 +79,35 @@ function queryActiveTab(): Promise<chrome.tabs.Tab | null> {
   });
 }
 
-function isCropVisible(cropRect: CropRect): boolean {
+function isCropVisible(cropRect: CropRect, viewport?: ViewportInfo): boolean {
+  if (cropRect.width <= 0 || cropRect.height <= 0) return false;
+
+  const viewportWidth = Number(viewport?.width) || 0;
+  const viewportHeight = Number(viewport?.height) || 0;
+
+  // MV3 service worker does not have window/screen. If content script did not provide
+  // viewport size, avoid throwing and allow the screenshot fallback to proceed.
+  if (!viewportWidth || !viewportHeight) return true;
+
   return (
-    cropRect.width > 0 &&
-    cropRect.height > 0 &&
-    cropRect.left < screen.width &&
-    cropRect.top < screen.height &&
+    cropRect.left < viewportWidth &&
+    cropRect.top < viewportHeight &&
     cropRect.left + cropRect.width > 0 &&
     cropRect.top + cropRect.height > 0
   );
 }
 
-async function captureVisibleTab(expectedTabId?: number, cropRect?: CropRect): Promise<string> {
+async function captureVisibleTab(
+  expectedTabId?: number,
+  cropRect?: CropRect,
+  viewport?: ViewportInfo
+): Promise<string> {
   const activeTab = await queryActiveTab();
   if (expectedTabId && activeTab?.id !== expectedTabId) {
     throw new Error('当前标签页已切换，已取消截图 OCR，避免识别到错误标签页');
   }
 
-  if (cropRect && !isCropVisible(cropRect)) {
+  if (cropRect && !isCropVisible(cropRect, viewport)) {
     throw new Error('图片不在当前可见区域，已跳过截图 OCR');
   }
 
@@ -163,9 +179,10 @@ async function captureAndRecognizeVisibleImage(
   devicePixelRatio: number,
   apiKey: string,
   model: string,
-  tabId?: number
+  tabId?: number,
+  viewport?: ViewportInfo
 ) {
-  const screenshot = await captureVisibleTab(tabId, cropRect);
+  const screenshot = await captureVisibleTab(tabId, cropRect, viewport);
   const croppedImage = await cropCapturedImage(screenshot, cropRect, devicePixelRatio);
   return recognizeWithZhipuOCR(croppedImage, apiKey, model);
 }
@@ -281,7 +298,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
               message.devicePixelRatio || 1,
               message.apiKey,
               message.model || 'glm-ocr',
-              sender.tab?.id
+              sender.tab?.id,
+              {
+                width: Number(message.viewportWidth) || undefined,
+                height: Number(message.viewportHeight) || undefined
+              }
             );
 
             sendResponse({
