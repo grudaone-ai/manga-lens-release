@@ -1,34 +1,30 @@
 import { translatePixivMangaImageWithVision } from './modules/zhipu-vision-client';
 
-function buildFetchOptions(imageUrl: string, pageUrl?: string): RequestInit {
-  const options: RequestInit = {
-    mode: 'cors',
-    credentials: 'omit',
-    cache: 'force-cache'
-  };
+function uniqueUrls(urls: Array<string | undefined | null>): string[] {
+  return [...new Set(urls.filter((url): url is string => !!url && /^https?:\/\//i.test(url)))];
+}
 
-  if (!pageUrl) return options;
-
+function buildFetchOptions(pageUrl?: string): RequestInit {
+  let referrer = 'https://www.pixiv.net/';
   try {
-    const page = new URL(pageUrl);
-    const image = new URL(imageUrl);
-
-    if (image.hostname.endsWith('pximg.net') && page.hostname.endsWith('pixiv.net')) {
-      return {
-        ...options,
-        referrer: page.origin + '/',
-        referrerPolicy: 'strict-origin-when-cross-origin'
-      };
+    if (pageUrl && new URL(pageUrl).hostname.endsWith('pixiv.net')) {
+      referrer = pageUrl;
     }
-
-    return {
-      ...options,
-      referrer: pageUrl,
-      referrerPolicy: 'strict-origin-when-cross-origin'
-    };
   } catch {
-    return options;
+    // keep default referrer
   }
+
+  return {
+    mode: 'cors',
+    credentials: 'include',
+    cache: 'reload',
+    referrer,
+    referrerPolicy: 'no-referrer-when-downgrade',
+    headers: {
+      Accept: 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
+      'Accept-Language': navigator.language || 'zh-CN,zh;q=0.9,en;q=0.8'
+    }
+  };
 }
 
 async function fetchWithTimeout(url: string, options: RequestInit, timeoutMs = 20000): Promise<Response> {
@@ -41,21 +37,45 @@ async function fetchWithTimeout(url: string, options: RequestInit, timeoutMs = 2
   }
 }
 
-async function fetchImageAsBase64(imageUrl: string, pageUrl?: string): Promise<{ base64: string; contentType: string }> {
-  const response = await fetchWithTimeout(imageUrl, buildFetchOptions(imageUrl, pageUrl));
-  if (!response.ok) {
-    throw new Error(`Pixiv 图片获取失败: HTTP ${response.status}`);
-  }
-
-  const arrayBuffer = await response.arrayBuffer();
-  const bytes = new Uint8Array(arrayBuffer);
+function arrayBufferToBase64(buffer: ArrayBuffer, contentType = 'image/jpeg'): { base64: string; contentType: string } {
+  const bytes = new Uint8Array(buffer);
   let binary = '';
-  for (let index = 0; index < bytes.byteLength; index += 1) {
-    binary += String.fromCharCode(bytes[index]);
+  const chunkSize = 0x8000;
+  for (let index = 0; index < bytes.length; index += chunkSize) {
+    const chunk = bytes.subarray(index, index + chunkSize);
+    binary += String.fromCharCode(...chunk);
+  }
+  return { base64: `data:${contentType};base64,${btoa(binary)}`, contentType };
+}
+
+async function fetchOneImageAsBase64(imageUrl: string, pageUrl?: string): Promise<{ base64: string; contentType: string }> {
+  const response = await fetchWithTimeout(imageUrl, buildFetchOptions(pageUrl));
+  if (!response.ok) {
+    throw new Error(`HTTP ${response.status}`);
   }
 
   const contentType = response.headers.get('content-type') || 'image/jpeg';
-  return { base64: `data:${contentType};base64,${btoa(binary)}`, contentType };
+  const buffer = await response.arrayBuffer();
+  return arrayBufferToBase64(buffer, contentType);
+}
+
+async function fetchPixivImageAsBase64(
+  imageUrls: string[],
+  pageUrl?: string
+): Promise<{ base64: string; contentType: string; usedUrl: string; attempts: string[] }> {
+  const attempts: string[] = [];
+
+  for (const url of uniqueUrls(imageUrls)) {
+    try {
+      const result = await fetchOneImageAsBase64(url, pageUrl);
+      return { ...result, usedUrl: url, attempts };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      attempts.push(`${url} => ${message}`);
+    }
+  }
+
+  throw new Error(`Pixiv 图片获取失败。已尝试: ${attempts.join('；')}`);
 }
 
 chrome.runtime.onInstalled.addListener(() => {
@@ -84,10 +104,14 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     case 'TRANSLATE_PIXIV_IMAGE':
       (async () => {
         try {
-          if (!message.imageUrl) throw new Error('缺少 Pixiv 图片 URL');
           if (!message.apiKey) throw new Error('缺少智谱 API Key');
+          const imageUrls = uniqueUrls([
+            ...(Array.isArray(message.imageUrls) ? message.imageUrls : []),
+            message.imageUrl
+          ]);
+          if (imageUrls.length === 0) throw new Error('缺少 Pixiv 图片 URL');
 
-          const fetched = await fetchImageAsBase64(message.imageUrl, message.pageUrl);
+          const fetched = await fetchPixivImageAsBase64(imageUrls, message.pageUrl);
           const result = await translatePixivMangaImageWithVision(
             fetched.base64,
             message.apiKey,
@@ -101,7 +125,9 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
             rawText: result.rawText,
             source: 'pixiv-html-url',
             sourceMessage: `已从 Pixiv HTML 图片 URL 获取图片并交给 ${message.model || 'glm-4.6v'} 识别翻译`,
-            contentType: fetched.contentType
+            contentType: fetched.contentType,
+            usedUrl: fetched.usedUrl,
+            attempts: fetched.attempts
           });
         } catch (error) {
           sendResponse({
