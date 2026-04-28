@@ -2,7 +2,6 @@ import { overlayManager } from './modules/translation-overlay';
 import { progressReporter } from './modules/progress-reporter';
 import {
   detectPixivMode,
-  getCurrentVisiblePixivPage,
   getPixivArtworkId,
   getPixivPages,
   type PixivMangaPage
@@ -11,27 +10,27 @@ import type { PixivVisionTranslationItem } from './modules/zhipu-vision-client';
 
 interface MangaLensState {
   isEnabled: boolean;
-  isProcessing: boolean;
   zhipuApiKey: string;
   zhipuVisionModel: string;
   processedPages: Set<string>;
   processingPages: Set<string>;
+  queuedPages: Set<string>;
   failedPages: Map<string, number>;
   cache: Map<string, PixivVisionTranslationItem[]>;
   pageGeneration: number;
 }
 
-const FAILED_PAGE_COOLDOWN_MS = 30000;
+const FAILED_PAGE_COOLDOWN_MS = 2000;
 const SCROLL_IDLE_MS = 650;
-const AUTO_PREFETCH_NEXT_PAGE = false;
+const MAX_CONCURRENT_TRANSLATIONS = 2;
 
 const state: MangaLensState = {
   isEnabled: true,
-  isProcessing: false,
   zhipuApiKey: '',
   zhipuVisionModel: 'glm-4.6v',
   processedPages: new Set(),
   processingPages: new Set(),
+  queuedPages: new Set(),
   failedPages: new Map(),
   cache: new Map(),
   pageGeneration: 0
@@ -40,6 +39,8 @@ const state: MangaLensState = {
 let scrollTimer: number | undefined;
 let routeTimer: number | undefined;
 let lastUrl = location.href;
+let activeWorkers = 0;
+const pageQueue: PixivMangaPage[] = [];
 
 function isPixivArtworkPage(): boolean {
   return /(?:^|\.)pixiv\.net$/i.test(location.hostname) && !!getPixivArtworkId();
@@ -49,10 +50,21 @@ function pageLabel(page: PixivMangaPage): string {
   return `${page.artworkId} p${page.pageIndex + 1}`;
 }
 
-function getImageUrlForModel(page: PixivMangaPage): string {
-  // Pixiv reader anchors expose img-original in href. Use original first because it is clearer
-  // than the display-size master image, but fall back to preview when original is absent.
-  return page.originalUrl || page.previewUrl;
+function currentPageTotal(): number {
+  return getPixivPages().length || 1;
+}
+
+function completedCount(): number {
+  return state.processedPages.size;
+}
+
+function getImageUrlsForModel(page: PixivMangaPage): string[] {
+  return [page.previewUrl, page.originalUrl].filter((url): url is string => !!url);
+}
+
+function isCoolingDown(page: PixivMangaPage): boolean {
+  const lastFailedAt = state.failedPages.get(page.cacheKey);
+  return !!lastFailedAt && Date.now() - lastFailedAt < FAILED_PAGE_COOLDOWN_MS;
 }
 
 function sendMessageToBackground<T = any>(message: Record<string, unknown>): Promise<T> {
@@ -91,19 +103,9 @@ async function waitForImageReady(img: HTMLImageElement): Promise<boolean> {
 }
 
 async function translatePixivPage(page: PixivMangaPage, generation = state.pageGeneration): Promise<void> {
-  if (!state.isEnabled || state.isProcessing) return;
+  if (!state.isEnabled) return;
   if (state.processedPages.has(page.cacheKey) || state.processingPages.has(page.cacheKey)) return;
-
-  const lastFailedAt = state.failedPages.get(page.cacheKey);
-  if (lastFailedAt && Date.now() - lastFailedAt < FAILED_PAGE_COOLDOWN_MS) {
-    progressReporter.update({
-      stage: 'skip',
-      title: '当前漫画页处于失败冷却中',
-      detail: pageLabel(page),
-      warning: '30 秒内不重复请求失败页'
-    });
-    return;
-  }
+  if (isCoolingDown(page)) return;
 
   if (!state.zhipuApiKey) {
     progressReporter.update({
@@ -120,6 +122,9 @@ async function translatePixivPage(page: PixivMangaPage, generation = state.pageG
       stage: 'skip',
       title: 'Pixiv 漫画图尚未加载完成',
       detail: pageLabel(page),
+      imageIndex: page.pageIndex + 1,
+      imageTotal: currentPageTotal(),
+      queueLength: pageQueue.length,
       warning: 'naturalWidth/naturalHeight 为空'
     });
     return;
@@ -133,41 +138,56 @@ async function translatePixivPage(page: PixivMangaPage, generation = state.pageG
       stage: 'done',
       title: '已使用缓存渲染 Pixiv 漫画页',
       detail: pageLabel(page),
+      imageIndex: page.pageIndex + 1,
+      imageTotal: currentPageTotal(),
+      queueLength: pageQueue.length,
       source: 'cache',
       dialogs: cached.length,
-      rendered: overlayIds.length
+      rendered: overlayIds.length,
+      translated: completedCount(),
+      totalToTranslate: currentPageTotal()
     });
     await updatePopupStatus();
     return;
   }
 
   const startedAt = Date.now();
-  state.isProcessing = true;
   state.processingPages.add(page.cacheKey);
 
   try {
     progressReporter.update({
       stage: 'image-source',
       title: '从 Pixiv HTML 容器读取漫画图',
-      detail: `${pageLabel(page)} · ${detectPixivMode()} 模式`,
-      source: 'pixiv-html-url'
+      detail: `${pageLabel(page)} · 并发 ${activeWorkers}/${MAX_CONCURRENT_TRANSLATIONS}`,
+      imageIndex: page.pageIndex + 1,
+      imageTotal: currentPageTotal(),
+      queueLength: pageQueue.length,
+      source: 'pixiv-html-url',
+      translated: completedCount(),
+      totalToTranslate: currentPageTotal()
     });
 
-    const imageUrl = getImageUrlForModel(page);
-    if (!imageUrl) throw new Error('没有找到 Pixiv 漫画图片 URL');
+    const imageUrls = getImageUrlsForModel(page);
+    if (imageUrls.length === 0) throw new Error('没有找到 Pixiv 漫画图片 URL');
 
     progressReporter.update({
       stage: 'translate',
-      title: `正在调用 ${state.zhipuVisionModel} 识别并翻译`,
-      detail: pageLabel(page),
+      title: `等待 ${state.zhipuVisionModel} 返回结果`,
+      detail: `${pageLabel(page)} · 已提交视觉翻译请求，模型生成中`,
+      imageIndex: page.pageIndex + 1,
+      imageTotal: currentPageTotal(),
+      queueLength: pageQueue.length,
       source: 'pixiv-html-url',
+      translated: completedCount(),
+      totalToTranslate: currentPageTotal(),
       elapsedMs: Date.now() - startedAt
     });
 
     const response = await sendMessageToBackground<any>({
       target: 'background',
       type: 'TRANSLATE_PIXIV_IMAGE',
-      imageUrl,
+      imageUrl: imageUrls[0],
+      imageUrls,
       pageUrl: location.href,
       apiKey: state.zhipuApiKey,
       model: state.zhipuVisionModel,
@@ -184,9 +204,14 @@ async function translatePixivPage(page: PixivMangaPage, generation = state.pageG
     progressReporter.update({
       stage: 'render',
       title: '正在渲染 GLM-4.6V 译文',
-      detail: response.sourceMessage || pageLabel(page),
+      detail: `${response.sourceMessage || pageLabel(page)} · 识别 ${items.length} 段`,
+      imageIndex: page.pageIndex + 1,
+      imageTotal: currentPageTotal(),
+      queueLength: pageQueue.length,
       source: response.source || 'pixiv-html-url',
       dialogs: items.length,
+      translated: completedCount(),
+      totalToTranslate: currentPageTotal(),
       elapsedMs: Date.now() - startedAt
     });
 
@@ -198,10 +223,15 @@ async function translatePixivPage(page: PixivMangaPage, generation = state.pageG
     progressReporter.update({
       stage: 'done',
       title: 'Pixiv 漫画页翻译完成',
-      detail: pageLabel(page),
+      detail: `${pageLabel(page)} · 已完成 ${completedCount()}/${currentPageTotal()} 页`,
+      imageIndex: page.pageIndex + 1,
+      imageTotal: currentPageTotal(),
+      queueLength: pageQueue.length,
       source: response.source || 'pixiv-html-url',
       dialogs: items.length,
       rendered: overlayIds.length,
+      translated: completedCount(),
+      totalToTranslate: currentPageTotal(),
       elapsedMs: Date.now() - startedAt
     });
 
@@ -212,15 +242,61 @@ async function translatePixivPage(page: PixivMangaPage, generation = state.pageG
     progressReporter.update({
       stage: 'error',
       title: 'Pixiv 漫画页翻译失败',
-      detail: pageLabel(page),
+      detail: `${pageLabel(page)} · 2 秒后可重试`,
+      imageIndex: page.pageIndex + 1,
+      imageTotal: currentPageTotal(),
+      queueLength: pageQueue.length,
       source: 'pixiv-html-url',
       error: message,
       elapsedMs: Date.now() - startedAt
     });
     console.error('[MangaLens] Pixiv 漫画页翻译失败:', error);
   } finally {
-    state.isProcessing = false;
     state.processingPages.delete(page.cacheKey);
+  }
+}
+
+function enqueuePages(pages: PixivMangaPage[], reason: string): void {
+  let added = 0;
+  for (const page of pages) {
+    if (state.processedPages.has(page.cacheKey)) continue;
+    if (state.processingPages.has(page.cacheKey)) continue;
+    if (state.queuedPages.has(page.cacheKey)) continue;
+    if (isCoolingDown(page)) continue;
+
+    pageQueue.push(page);
+    state.queuedPages.add(page.cacheKey);
+    added += 1;
+  }
+
+  if (added > 0) {
+    progressReporter.update({
+      stage: 'queued',
+      title: 'Pixiv 漫画页已加入翻译队列',
+      detail: `${reason} · 新增 ${added} 页 · 当前队列 ${pageQueue.length} 页 · 并发 ${MAX_CONCURRENT_TRANSLATIONS}`,
+      imageTotal: currentPageTotal(),
+      queueLength: pageQueue.length,
+      translated: completedCount(),
+      totalToTranslate: currentPageTotal(),
+      source: 'pixiv-html-dom'
+    });
+  }
+
+  void drainQueue();
+}
+
+async function drainQueue(): Promise<void> {
+  while (state.isEnabled && activeWorkers < MAX_CONCURRENT_TRANSLATIONS && pageQueue.length > 0) {
+    const page = pageQueue.shift();
+    if (!page) continue;
+    state.queuedPages.delete(page.cacheKey);
+
+    activeWorkers += 1;
+    void translatePixivPage(page)
+      .finally(() => {
+        activeWorkers -= 1;
+        void drainQueue();
+      });
   }
 }
 
@@ -231,21 +307,14 @@ function findTargetPages(): PixivMangaPage[] {
   const pages = getPixivPages();
 
   if (mode === 'reader') {
-    const current = getCurrentVisiblePixivPage(pages);
-    if (!current) return [];
-
-    if (!AUTO_PREFETCH_NEXT_PAGE) return [current];
-    const next = pages.find((page) => page.pageIndex === current.pageIndex + 1);
-    return next ? [current, next] : [current];
+    return pages;
   }
 
-  // Detail page: intentionally translate only the visible p0 preview image. Recommended works,
-  // author gallery, comments, avatars and ads are excluded by artworkId + page filtering.
   return pages.slice(0, 1);
 }
 
 async function processCurrentPixivTarget(reason: string): Promise<void> {
-  if (!state.isEnabled || state.isProcessing) return;
+  if (!state.isEnabled) return;
 
   if (!isPixivArtworkPage()) {
     progressReporter.update({
@@ -261,14 +330,15 @@ async function processCurrentPixivTarget(reason: string): Promise<void> {
   progressReporter.update({
     stage: 'scan',
     title: '正在定位 Pixiv 漫画页',
-    detail: `${mode} 模式 · ${reason} · 找到 ${pages.length} 张目标图`,
+    detail: `${mode} 模式 · ${reason} · 当前 HTML 中找到 ${pages.length} 张目标图`,
+    imageTotal: pages.length || currentPageTotal(),
+    queueLength: pageQueue.length,
+    translated: completedCount(),
+    totalToTranslate: pages.length || currentPageTotal(),
     source: 'pixiv-html-dom'
   });
 
-  const page = pages.find((candidate) => !state.processedPages.has(candidate.cacheKey)) || pages[0];
-  if (!page) return;
-
-  await translatePixivPage(page);
+  enqueuePages(pages, reason);
 }
 
 function scheduleProcess(reason: string, delay = SCROLL_IDLE_MS): void {
@@ -293,15 +363,18 @@ async function loadConfig(): Promise<void> {
 
 function resetPageState(): void {
   state.pageGeneration += 1;
-  state.isProcessing = false;
-  state.processedPages.clear();
+  activeWorkers = 0;
+  pageQueue.length = 0;
+  state.queuedPages.clear();
   state.processingPages.clear();
+  state.processedPages.clear();
   state.failedPages.clear();
   overlayManager.removeAllOverlays();
   progressReporter.update({
     stage: 'scan',
     title: 'Pixiv 页面状态已重置',
     detail: location.href,
+    queueLength: 0,
     source: 'pixiv-html-dom'
   });
 }
@@ -317,15 +390,18 @@ async function initialize(): Promise<void> {
 
     scheduleProcess('初始化', 1000);
 
-    window.addEventListener('scroll', () => scheduleProcess('滚动停止'), { passive: true });
+    window.addEventListener('scroll', () => {
+      overlayManager.schedulePositionSync();
+      scheduleProcess('滚动停止');
+    }, { passive: true });
+
     window.addEventListener('resize', () => {
-      overlayManager.removeAllOverlays();
-      state.processedPages.clear();
+      overlayManager.schedulePositionSync();
       scheduleProcess('窗口尺寸变化', 500);
     });
 
     const observer = new MutationObserver(() => {
-      // Pixiv is a SPA. Do not process every mutation immediately; just run once after DOM settles.
+      overlayManager.schedulePositionSync();
       scheduleProcess('Pixiv DOM 更新', 900);
     });
     observer.observe(document.body, { childList: true, subtree: true });
@@ -374,7 +450,6 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       break;
 
     case 'SELECT_IMAGE':
-      // Manual selection is intentionally removed. Pixiv pages are selected from HTML containers only.
       scheduleProcess('从 Pixiv HTML 当前容器重新选择', 0);
       sendResponse({ success: true });
       break;
