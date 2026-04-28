@@ -9,6 +9,15 @@ export interface TranslationOverlay {
   config: Required<RenderConfig>;
 }
 
+interface PositionedOverlay {
+  overlay: TranslationOverlay;
+  left: number;
+  top: number;
+  width: number;
+  height: number;
+  originalTop: number;
+}
+
 export interface RenderConfig {
   fontSize?: number;
   color?: string;
@@ -46,6 +55,16 @@ function hexToRgba(hex: string, alpha: number): string {
   const g = Number.parseInt(normalized.slice(2, 4), 16);
   const b = Number.parseInt(normalized.slice(4, 6), 16);
   return `rgba(${r},${g},${b},${alpha})`;
+}
+
+function overlaps(a: PositionedOverlay, b: PositionedOverlay): boolean {
+  const gap = 3;
+  return !(
+    a.left + a.width + gap <= b.left ||
+    b.left + b.width + gap <= a.left ||
+    a.top + a.height + gap <= b.top ||
+    b.top + b.height + gap <= a.top
+  );
 }
 
 export class TranslationOverlayManager {
@@ -180,26 +199,54 @@ export class TranslationOverlayManager {
       config: cfg
     });
 
-    this.applyOverlayPosition(this.overlays.get(id)!);
+    this.updateOverlayPositions();
     return id;
   }
 
   updateOverlayPositions(): void {
+    const groups = new Map<HTMLImageElement, TranslationOverlay[]>();
     for (const overlay of this.overlays.values()) {
-      this.applyOverlayPosition(overlay);
+      const group = groups.get(overlay.imageElement) || [];
+      group.push(overlay);
+      groups.set(overlay.imageElement, group);
+    }
+
+    for (const [imageElement, overlays] of groups.entries()) {
+      this.updateImageOverlayGroup(imageElement, overlays);
     }
   }
 
-  private applyOverlayPosition(overlay: TranslationOverlay): void {
-    const imageRect = overlay.imageElement.getBoundingClientRect();
-    const { item, config: cfg, element } = overlay;
-
+  private updateImageOverlayGroup(imageElement: HTMLImageElement, overlays: TranslationOverlay[]): void {
+    const imageRect = imageElement.getBoundingClientRect();
     if (imageRect.width <= 0 || imageRect.height <= 0 || imageRect.bottom < 0 || imageRect.top > window.innerHeight) {
-      element.style.display = 'none';
+      overlays.forEach((overlay) => { overlay.element.style.display = 'none'; });
       return;
     }
 
-    element.style.display = 'flex';
+    const positioned = overlays
+      .map((overlay) => this.calculateOverlayPosition(overlay, imageRect))
+      .sort((a, b) => a.top - b.top || a.left - b.left);
+
+    const placed: PositionedOverlay[] = [];
+    for (const item of positioned) {
+      let candidate = item;
+      let attempts = 0;
+      while (placed.some((other) => overlaps(candidate, other)) && attempts < 18) {
+        const direction = attempts % 2 === 0 ? 1 : -1;
+        const step = Math.ceil((attempts + 1) / 2) * 8;
+        candidate = {
+          ...candidate,
+          top: clamp(item.originalTop + direction * step, imageRect.top, Math.max(imageRect.top, imageRect.bottom - item.height))
+        };
+        attempts += 1;
+      }
+      placed.push(candidate);
+      this.applyPosition(candidate);
+    }
+  }
+
+  private calculateOverlayPosition(overlay: TranslationOverlay, imageRect: DOMRect): PositionedOverlay {
+    const { item, config: cfg } = overlay;
     const [x1, y1, x2, y2] = item.bbox;
 
     let leftPx = imageRect.left + (x1 / 1000) * imageRect.width;
@@ -223,13 +270,28 @@ export class TranslationOverlayManager {
     leftPx = clamp(leftPx, imageRect.left, Math.max(imageRect.left, imageRect.right - widthPx));
     topPx = clamp(topPx, imageRect.top, Math.max(imageRect.top, imageRect.bottom - heightPx));
 
-    const bgWithOpacity = hexToRgba(cfg.background, cfg.backgroundOpacity);
-    const fontSize = clamp(Math.round(Math.min(cfg.fontSize, widthPx / Math.max(4, Math.min(8, text.length)))), 10, cfg.fontSize);
+    return {
+      overlay,
+      left: leftPx,
+      top: topPx,
+      width: widthPx,
+      height: heightPx,
+      originalTop: topPx
+    };
+  }
 
-    element.style.left = `${leftPx}px`;
-    element.style.top = `${topPx}px`;
-    element.style.width = `${widthPx}px`;
-    element.style.minHeight = `${heightPx}px`;
+  private applyPosition(positioned: PositionedOverlay): void {
+    const { overlay, left, top, width, height } = positioned;
+    const { item, config: cfg, element } = overlay;
+
+    element.style.display = 'flex';
+    const bgWithOpacity = hexToRgba(cfg.background, cfg.backgroundOpacity);
+    const fontSize = clamp(Math.round(Math.min(cfg.fontSize, width / Math.max(4, Math.min(8, item.translatedText.length)))), 10, cfg.fontSize);
+
+    element.style.left = `${left}px`;
+    element.style.top = `${top}px`;
+    element.style.width = `${width}px`;
+    element.style.minHeight = `${height}px`;
     element.style.fontSize = `${fontSize}px`;
     element.style.color = cfg.color;
     element.style.background = bgWithOpacity;
